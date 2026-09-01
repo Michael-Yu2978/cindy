@@ -2,6 +2,13 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 5_000;
 const HELPER_EXIT_TIMEOUT_MS = 2_000;
+// PowerShell cold start + Add-Type P/Invoke compilation on a slow/loaded Windows
+// runner can exceed the busy-path budget: with a 50ms mutex wait the old cap
+// (timeoutMs + 1_000) left only ~1s for the helper to boot and report. The
+// helper's mutex wait is still bounded by its own WaitOne(timeoutMs), so this
+// startup grace only tolerates a slower helper boot; fail-closed semantics are
+// unchanged.
+const HELPER_STARTUP_GRACE_MS = 10_000;
 const MAX_HELPER_OUTPUT_BYTES = 16 * 1024;
 
 const WINDOWS_PACKAGED_INSTANCE_BARRIER_SCRIPT = String.raw`
@@ -114,7 +121,7 @@ function waitForFirstLine(
     const timer = setTimeout(() => {
       finish(() => reject(new Error('timed out acquiring Windows packaged-instance barrier')));
       child.kill();
-    }, timeoutMs + 1_000);
+    }, Math.max(timeoutMs + 1_000, HELPER_STARTUP_GRACE_MS));
     const onStdout = (chunk: Buffer | string): void => {
       stdout += chunk.toString();
       if (stdout.length > MAX_HELPER_OUTPUT_BYTES) {
