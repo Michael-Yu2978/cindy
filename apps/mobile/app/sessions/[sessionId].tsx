@@ -175,6 +175,7 @@ import {
 import {
   buildSessionRuntimeOptions,
   normalizeMobileAgentCapabilities,
+  reconcileRuntimeDraftWithCapabilities,
   type MobileAgentCapabilities,
   type MobileModelOption,
   type MobileSessionRuntimeOptions,
@@ -186,6 +187,7 @@ import type { MobileModelMemoryAccessors } from '@/session/draftModelMemory';
 import { ModelPickerSheet } from '@/session/ModelPickerSheet';
 import { MobileModelIconMark } from '@/session/MobileProviderMark';
 import { getModel } from '@cindy/model-providers/registry';
+import { shouldBlockLegacyRemoteModelWindowSwitch } from '@cindy/maker-shared/agent-capabilities';
 import { clearSessionMirror, makeSessionMirrorAccessors } from '@/session/sessionModelMirror';
 import { effortLabelFromRuntime, rowFastEditable } from '@/session/modelPickerRows';
 import {
@@ -7641,7 +7643,7 @@ export default function SessionScreen() {
    *    改为回读权威会话收敛乐观维度;回读也失败(多半同一网络故障)才退回本地回滚。
    */
   const runControlAction = useCallback(async (
-    action: () => Promise<void>,
+    action: () => Promise<void | boolean>,
     optimisticPatch?: Partial<RemoteSession>,
     opts?: { recover?: 'rollback' | 'refetch' },
   ) => {
@@ -7666,7 +7668,10 @@ export default function SessionScreen() {
       remoteSessionStore.applySessionPatch(deviceId, sessionId, optimisticPatch);
     }
     try {
-      await action();
+      const applied = await action();
+      if (applied === false && rollbackPatch && deviceId) {
+        remoteSessionStore.applySessionPatch(deviceId, sessionId, rollbackPatch);
+      }
     } catch (err) {
       if (rollbackPatch && optimisticPatch && deviceId) {
         let recovered = false;
@@ -8072,6 +8077,72 @@ export default function SessionScreen() {
     void runGoalAction(() => maker.goal.clear(sessionId), null);
   }, [maker, runGoalAction, sessionId]);
 
+  const showRemoteModelWindowUnsupported = useCallback((
+    targetContextWindow: number | undefined,
+    fallbackDescription?: string,
+  ): void => {
+    const contextTokens = currentSession?.contextTokens;
+    const description =
+      typeof contextTokens === 'number' &&
+      Number.isFinite(contextTokens) &&
+      contextTokens > 0 &&
+      typeof targetContextWindow === 'number' &&
+      Number.isFinite(targetContextWindow) &&
+      targetContextWindow > 0
+        ? t('models.contextWindowSwitch.remoteDescription', {
+            used: formatModelWindowTokens(contextTokens),
+            total: formatModelWindowTokens(targetContextWindow),
+            pct: Math.round((contextTokens / targetContextWindow) * 100),
+          })
+        : fallbackDescription;
+    Alert.alert(t('models.contextWindowSwitch.remoteTitle'), description, [
+      { text: t('models.contextWindowSwitch.cancel'), style: 'cancel' },
+    ]);
+  }, [currentSession?.contextTokens, t]);
+
+  const setComposerModel = useCallback(async (args: {
+    model: string;
+    providerId?: string;
+    targetContextWindow?: number;
+    selection?: { effort: string | null; fastMode: boolean };
+  }): Promise<boolean> => {
+    if (shouldBlockLegacyRemoteModelWindowSwitch({
+      hostGuardSupported: modelSheetCapabilities?.supportsModelWindowSwitchGuard === true,
+      agentKind: sessionAgentKind,
+      contextTokens: currentSession?.contextTokens,
+      currentContextWindow: currentSession?.contextWindow,
+      targetContextWindow: args.targetContextWindow,
+    })) {
+      showRemoteModelWindowUnsupported(args.targetContextWindow);
+      return false;
+    }
+    try {
+      await maker.setModel(sessionId, args.model, args.providerId, args.selection);
+      return true;
+    } catch (err) {
+      const reason = formatRemoteError(err);
+      const isRemoteModelWindowUnsupported =
+        reason.includes('remote model-window rebuild is unsupported') ||
+        reason.includes('remote model-window confirmation is unsupported');
+      if (
+        !isPreconditionFailedRemoteError(err) ||
+        !isRemoteModelWindowUnsupported
+      ) {
+        throw err;
+      }
+      showRemoteModelWindowUnsupported(args.targetContextWindow, reason);
+      return false;
+    }
+  }, [
+    currentSession?.contextTokens,
+    currentSession?.contextWindow,
+    maker,
+    modelSheetCapabilities?.supportsModelWindowSwitchGuard,
+    sessionAgentKind,
+    sessionId,
+    showRemoteModelWindowUnsupported,
+  ]);
+
   // 选行 = 原子切「来源 + 模型 + effort + fast」(effort 优先级与桌面同源:该 (来源,模型) 的
   // 会话镜像记忆 → 沿用当前档 → 模型默认;同模型换来源不沿用;fast 按镜像恢复、fastEditable 门控)。
   const selectComposerModelRow = useCallback((row: ProviderModelRow) => {
@@ -8096,26 +8167,38 @@ export default function SessionScreen() {
       });
       return;
     }
-    void runControlAction(async () => {
-      await maker.setModel(sessionId, next.model, next.providerId);
-      if (next.effort && next.effort !== modelSheetSelection.effort) {
-        await maker.setEffort(sessionId, next.effort);
-      }
-      // 只按值变化写穿,不做 fastEditable 门控:切到不支持 fast 的模型时
-      // resolveRowSelection 已算出 fastMode=false,门控会跳过清零、让服务端残留 true。
-      if (next.fastMode !== modelSheetSelection.fastMode) {
-        await maker.setFastMode(sessionId, next.fastMode);
-      }
-    }, {
-      // 乐观 patch:原子切换的三个维度一次上屏。
-      model: next.model,
-      providerId: next.providerId,
-      ...(next.effort ? { effort: next.effort } : {}),
-      fastMode: next.fastMode,
-      ...(agentSwitchIntent ? { agentSwitchIntent: null } : {}),
-      // 多步 RPC(setModel → setEffort → setFastMode)可能部分成功,失败时回读权威
-      // 会话收敛而非本地回滚,避免手机显示与远端已生效状态脱节(codex review R16)。
-    }, { recover: 'refetch' });
+    const atomicSelection = modelSheetCapabilities?.supportsModelWindowSwitchGuard === true
+      ? { effort: next.effort || null, fastMode: next.fastMode }
+      : undefined;
+    void (async () => {
+      await runControlAction(async () => {
+        const applied = await setComposerModel({
+          model: next.model,
+          providerId: next.providerId,
+          targetContextWindow: row.model.contextWindow,
+          selection: atomicSelection,
+        });
+        if (!applied) return false;
+        // 新 host 在 SET_MODEL 的 session lock 内落定全部轴，再唤醒重建后的输入队列。
+        // 旧 host 不懂 selection，保留原有低压/same/expand 兼容链；90% 缩窗已在上方拒绝。
+        if (!atomicSelection && next.effort && next.effort !== modelSheetSelection.effort) {
+          await maker.setEffort(sessionId, next.effort);
+        }
+        // 只按值变化写穿,不做 fastEditable 门控:切到不支持 fast 的模型时
+        // resolveRowSelection 已算出 fastMode=false,门控会跳过清零、让服务端残留 true。
+        if (!atomicSelection && next.fastMode !== modelSheetSelection.fastMode) {
+          await maker.setFastMode(sessionId, next.fastMode);
+        }
+      }, {
+        // 乐观 patch:原子切换的三个维度一次上屏。
+        model: next.model,
+        providerId: next.providerId,
+        ...(next.effort ? { effort: next.effort } : {}),
+        fastMode: next.fastMode,
+        ...(agentSwitchIntent ? { agentSwitchIntent: null } : {}),
+        // 旧 host 的兼容 RPC 链可能部分成功；失败时回读权威会话收敛而非本地回滚。
+      }, { recover: 'refetch' });
+    })();
   }, [
     agentSwitchIntent,
     canUseRemoteSessionControls,
@@ -8128,16 +8211,37 @@ export default function SessionScreen() {
     sessionAgentKind,
     sessionId,
     sessionMirrorAccessors,
+    setComposerModel,
     writeSessionAgentSwitchIntent,
   ]);
   const selectComposerFlatModel = useCallback((option: MobileModelOption) => {
     setModelSheetOpen(false);
     if (!canUseRemoteSessionControls || modelSheetAgentKind !== sessionAgentKind) return;
-    void runControlAction(() => maker.setModel(sessionId, option.id), {
+    const next = reconcileRuntimeDraftWithCapabilities({
       model: option.id,
-      ...(agentSwitchIntent ? { agentSwitchIntent: null } : {}),
-    });
-  }, [agentSwitchIntent, canUseRemoteSessionControls, maker, modelSheetAgentKind, runControlAction, sessionAgentKind, sessionId]);
+      effort: modelSheetSelection?.effort ?? '',
+      permissionMode: currentSession?.permissionMode ?? 'default',
+      fastMode: modelSheetSelection?.fastMode ?? false,
+    }, modelSheetCapabilities);
+    const atomicSelection = modelSheetCapabilities?.supportsModelWindowSwitchGuard === true
+      ? { effort: next.effort || null, fastMode: next.fastMode }
+      : undefined;
+    void (async () => {
+      await runControlAction(
+        () => setComposerModel({
+          model: option.id,
+          targetContextWindow: option.contextWindow,
+          selection: atomicSelection,
+        }),
+        {
+          model: option.id,
+          ...(atomicSelection?.effort ? { effort: atomicSelection.effort } : {}),
+          ...(atomicSelection ? { fastMode: atomicSelection.fastMode } : {}),
+          ...(agentSwitchIntent ? { agentSwitchIntent: null } : {}),
+        },
+      );
+    })();
+  }, [agentSwitchIntent, canUseRemoteSessionControls, currentSession?.permissionMode, modelSheetAgentKind, modelSheetCapabilities, modelSheetSelection?.effort, modelSheetSelection?.fastMode, runControlAction, sessionAgentKind, setComposerModel]);
   const browseComposerModelAgent = useCallback(async (next: MobileSessionAgentKind) => {
     if (next === modelSheetAgentKind) return true;
     if (next !== sessionAgentKind) {
@@ -10597,6 +10701,12 @@ function ComposerActivityStatus({
       </View>
     </View>
   );
+}
+
+function formatModelWindowTokens(value: number): string {
+  return value >= 1_000_000
+    ? `${(value / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+    : `${Math.round(value / 1_000)}K`;
 }
 
 function formatComposerActivityElapsed(seconds: number): string {
