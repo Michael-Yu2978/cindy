@@ -77,7 +77,7 @@ describe('history window backfill wiring', () => {
     // 换会话时整体重置,否则上个会话的已考察集合会压住新会话的补齐。
     expect(source).toContain('existingState?.sid === sessionId');
     expect(source).toContain('state.sid !== sessionIdAtStart || state.epoch !== epochAtStart');
-    expect(source).toContain('findHistoryWindowGap(messages, consideredKeys)');
+    expect(source).toContain('findHistoryWindowGap(latestMessagesRef.current, consideredKeys)');
     expect(source).toContain('...gapState.contiguous,');
     expect(source).toContain('...gapState.backfilled,');
     expect(source).toContain('...gapState.failed,');
@@ -130,7 +130,8 @@ describe('live stream interruption wiring', () => {
     // 持有的 topic 必须重新评估，不能和已释放 topic 一起饿死。
     expect(sendSubscribe).toContain('.filter((topic) => registryRef.current.hasTopic(deviceId, topic))');
     expect(sendSubscribe).toContain('toSend.every((topic) => registryRef.current.hasTopic(deviceId, topic))');
-    expect(sendSubscribe).toContain('if (!sent) {');
+    // The production loop is behavior-tested in subscriptionAcknowledgements.test.ts.
+    expect(sendSubscribe).toContain('await confirmTrackedSubscription({');
     // 反向竞态同样要守住：快速释放后又切回时，旧 unsubscribe 在真正发帧前必须
     // 剔除已经重新被 owner 持有的 topic，不能落在新 subscribe 后把实时流再关掉。
     expect(source).toContain('(topic) => !registryRef.current.hasTopic(deviceId, topic)');

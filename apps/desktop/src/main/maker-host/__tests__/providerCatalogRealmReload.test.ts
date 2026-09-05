@@ -138,11 +138,14 @@ vi.mock('../generic-oauth.js', () => ({
 }));
 vi.mock('../../secrets/providerSecretStore.js', () => ({
   genericOAuthSecretIo: {},
+  readCustomProviderHeaders: () => null,
   readCustomProviderKey: () => null,
   setProviderSecretsClearedListener: () => undefined,
   addProviderSecretsClearedListener: () => undefined,
 }));
 vi.mock('../provider-route.js', () => ({
+  getProviderRouteCredentialRevision: () => 0,
+  setCustomProviderHeaderReader: () => undefined,
   setCustomProviderKeyReader: () => undefined,
   setOAuthTokenReader: () => undefined,
   setProviderOAuthTokenReader: () => undefined,
@@ -184,6 +187,7 @@ import {
   buildUserProvider,
   type Catalog,
   type CustomProviderConfig,
+  XAI_API_CUSTOM_PROVIDER_ID,
 } from '@cindy/model-providers';
 import { deriveCindyMediaConfig } from '../../cindy-brain/cindyMediaCatalog.js';
 import {
@@ -203,6 +207,12 @@ import {
   reloadActiveCatalogForEndpointChange,
   syncLocalCatalogOverridesIntoActiveCatalog,
 } from '../createDesktopProviderService.js';
+import {
+  buildCodexCustomProviderArgs,
+  deriveCodexCustomProviderRoutes,
+  hasCodexAppliedCustomProviderCapability,
+  setCodexAppliedCustomProviderRoutes,
+} from '../codex-custom-provider-route.js';
 
 function catalogNamed(name: string, updatedAt?: string): Catalog {
   return {
@@ -299,6 +309,80 @@ describe('provider catalog realm reload', () => {
     h.customProviderRead.mockReset();
   });
 
+  it('does not let an older OFF refresh overwrite a newer ON catalog and Host spawn snapshot', async () => {
+    const disabled: CustomProviderConfig = {
+      id: 'image-capability-race-provider',
+      name: 'Image capability race fixture',
+      runtimes: {
+        codex: {
+          baseUrl: 'https://provider.example/v1',
+          wireProtocol: 'openai-responses',
+          models: [{ id: 'chat-model', name: 'Chat model' }],
+        },
+      },
+    };
+    const enabled: CustomProviderConfig = {
+      ...disabled,
+      runtimes: {
+        codex: {
+          ...disabled.runtimes.codex!,
+          supportsImageGeneration: true,
+        },
+      },
+    };
+    let resolveOlderRefresh!: (configs: CustomProviderConfig[]) => void;
+    h.customProviderRead.mockReset();
+    h.customProviderRead
+      .mockReturnValueOnce(
+        new Promise<CustomProviderConfig[]>((resolve) => {
+          resolveOlderRefresh = resolve;
+        }),
+      )
+      .mockResolvedValueOnce([enabled]);
+
+    const olderRefresh = refreshCustomProvidersIntoCatalog();
+    await refreshCustomProvidersIntoCatalog();
+    resolveOlderRefresh([disabled]);
+    await olderRefresh;
+
+    const routes = deriveCodexCustomProviderRoutes(getActiveCatalog());
+    expect(routes).toHaveLength(1);
+    expect(routes[0]?.responseModels).toEqual(['chat-model']);
+    setCodexAppliedCustomProviderRoutes(routes);
+    expect(hasCodexAppliedCustomProviderCapability(disabled.id, 'imageGeneration')).toBe(true);
+    const spawn = buildCodexCustomProviderArgs('http://127.0.0.1:43210', 'env-key', routes);
+    expect(spawn.extraArgs.filter((arg) => arg.includes('.name='))).toHaveLength(1);
+    expect(spawn.extraArgs.join(' ')).toContain('x-openai-actor-authorization');
+
+    setCodexAppliedCustomProviderRoutes([]);
+    setCustomProviders([]);
+    h.customProviderRead.mockReset();
+  });
+
+  it('projects executable Imagine models onto the xAI API-key source', () => {
+    setCustomProviders([
+      buildUserProvider({
+        id: XAI_API_CUSTOM_PROVIDER_ID,
+        name: 'xAI API',
+        runtimes: {
+          codex: {
+            baseUrl: 'https://api.x.ai/v1',
+            wireProtocol: 'openai-chat',
+            models: [{ id: 'grok-4.6', name: 'Grok 4.6' }],
+          },
+        },
+      }),
+    ]);
+
+    const projected = getActiveCatalog().providers.find(
+      (provider) => provider.id === XAI_API_CUSTOM_PROVIDER_ID,
+    );
+    const bundledXai = BUNDLED_CATALOG.providers.find((provider) => provider.id === 'xai');
+    expect(projected?.imageModels).toEqual(bundledXai?.imageModels);
+
+    setCustomProviders([]);
+  });
+
   it('does not publish a migrated snapshot after a failed CAS write', async () => {
     const original: CustomProviderConfig = {
       id: 'cas-provider',
@@ -360,6 +444,7 @@ describe('provider catalog realm reload', () => {
       (entry) => entry.id === 'openai/gpt-5.6-sol',
     );
     if (!currentEntry) throw new Error('expected gpt-5.6-sol Registry entry');
+    current.modelRegistry!.models = [currentEntry];
     currentEntry.perAgent = { ...currentEntry.perAgent, codex: { efforts: ['high'] } };
     setActiveCatalog(current);
 
@@ -380,6 +465,7 @@ describe('provider catalog realm reload', () => {
       (entry) => entry.id === 'openai/gpt-5.6-sol',
     );
     if (!nextEntry) throw new Error('expected gpt-5.6-sol Registry entry');
+    next.modelRegistry!.models = [nextEntry];
     nextEntry.perAgent = {
       ...nextEntry.perAgent,
       codex: { efforts: ['high', 'max', 'ultra'], defaultEffort: 'ultra' },
@@ -412,6 +498,7 @@ describe('provider catalog realm reload', () => {
       (candidate) => candidate.id === 'openai/gpt-5.6-sol',
     );
     if (!entry) throw new Error('expected gpt-5.6-sol Registry entry');
+    current.modelRegistry!.models = [entry];
     entry.perAgent = {
       ...entry.perAgent,
       codex: { efforts: ['minimal', 'max'], defaultEffort: 'max' },

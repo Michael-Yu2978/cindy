@@ -20,6 +20,7 @@
 import { randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { crc32 } from 'node:zlib';
 
 import {
   GHOST_LIBRARY_OPS,
@@ -32,8 +33,107 @@ import { LibraryBindingStore, type LibraryLocationResolution } from './libraryBi
 import { LibrarySqlService, type LibrarySqlServiceDeps } from './librarySqlService.js';
 import type { LibraryDbResult } from './libraryDbCore.js';
 
+/** 正本相对键:assets/<hash 前 2 位>/<64-hex>/blob.<ext>(不是 <hash>.<ext>)。 */
+const LIBRARY_BLOB_REL_RE = /^assets\/([0-9a-f]{2})\/([0-9a-f]{64})\/blob\.([A-Za-z0-9]+)$/i;
+const LIBRARY_SIDECAR_BASENAME = new Set(['meta.json', 'preview.webp']);
+/** clipboardWrite 单次 PNG 上限:与 library 单次 write 同为 16MiB,必须是有限整数。 */
+export const LIBRARY_CLIPBOARD_WRITE_MAX_BYTES = 16 * 1024 * 1024;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const PNG_IHDR = Buffer.from('IHDR', 'ascii');
+const PNG_IEND = Buffer.from('IEND', 'ascii');
+/** 签名(8) + 完整 IHDR 块(4+4+13+4=25) = 33。缺 IHDR 数据/CRC 的截断头不得写剪贴板。 */
+const PNG_IHDR_DATA_BYTES = 13;
+const PNG_IHDR_CHUNK_BYTES = 4 + 4 + PNG_IHDR_DATA_BYTES + 4;
+const PNG_MIN_BYTES = 8 + PNG_IHDR_CHUNK_BYTES;
+/** 与 getGhostLibrarySlot 生产接线同文案:无可见主壳窗时抛出,槽内映射 UNSUPPORTED。 */
+const CLIPBOARD_NO_HOST_WINDOW = '没有可挂靠的宿主窗口';
+
+function decodeStrictBase64(content: string): Buffer | null {
+  const compact = content.replace(/[\r\n]/g, '');
+  if (compact.length === 0) return Buffer.alloc(0);
+  if (compact.length % 4 !== 0) return null;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) return null;
+  const decoded = Buffer.from(compact, 'base64');
+  if (decoded.toString('base64') !== compact) return null;
+  return decoded;
+}
+
+function isPngBuffer(bytes: Buffer): boolean {
+  if (bytes.byteLength < PNG_MIN_BYTES) return false;
+  if (!bytes.subarray(0, PNG_SIGNATURE.byteLength).equals(PNG_SIGNATURE)) return false;
+  let offset = PNG_SIGNATURE.byteLength;
+  let sawIhdr = false;
+  let sawIend = false;
+  let chunkIndex = 0;
+  while (offset + 12 <= bytes.byteLength) {
+    if (sawIend) return false;
+    const length = bytes.readUInt32BE(offset);
+    const typeStart = offset + 4;
+    const dataStart = typeStart + 4;
+    const next = dataStart + length + 4;
+    if (!Number.isSafeInteger(length) || length < 0 || next > bytes.byteLength) return false;
+    const type = bytes.subarray(typeStart, dataStart);
+    const data = bytes.subarray(dataStart, dataStart + length);
+    const crc = bytes.readUInt32BE(dataStart + length);
+    if ((crc32(Buffer.concat([type, data])) >>> 0) !== crc) return false;
+    if (chunkIndex === 0) {
+      if (!type.equals(PNG_IHDR) || length !== PNG_IHDR_DATA_BYTES) return false;
+      const width = data.readUInt32BE(0);
+      const height = data.readUInt32BE(4);
+      if (width === 0 || height === 0) return false;
+      sawIhdr = true;
+    } else if (type.equals(PNG_IHDR)) {
+      return false;
+    }
+    if (type.equals(PNG_IEND)) {
+      if (length !== 0) return false;
+      if (next !== bytes.byteLength) return false;
+      sawIend = true;
+    }
+    offset = next;
+    chunkIndex += 1;
+  }
+  return sawIhdr && sawIend && offset === bytes.byteLength;
+}
+
+export function libraryBlobRelPath(hash: string, ext: string): string {
+  const cleanExt = ext.replace(/^\./, '');
+  return `assets/${hash.slice(0, 2)}/${hash}/blob.${cleanExt}`;
+}
+
+export function isLibrarySidecarRelPath(relPath: string): boolean {
+  const base = relPath.split('/').pop() ?? '';
+  return LIBRARY_SIDECAR_BASENAME.has(base);
+}
+
+export function isLibraryBlobRelPath(relPath: string): boolean {
+  const m = LIBRARY_BLOB_REL_RE.exec(relPath);
+  if (!m) return false;
+  return m[1] === m[2].slice(0, 2);
+}
+
+/**
+ * 插件回执 available 引用:协议形状不动,只改值。
+ * 已授权 + confirmed → library:assets/<2>/<hash>/blob.<ext>;
+ * 未授权维持 cindy-media://;SVG 未授权无备胎(返回 null);
+ * writing/unconfirmed/unavailable 不放开直读。
+ */
+export function libraryAvailableRef(input: {
+  authorized: boolean;
+  hash: string;
+  ext: string;
+  confirmed: boolean;
+}): string | null {
+  if (!input.confirmed) return null;
+  const ext = input.ext.replace(/^\./, '');
+  if (input.authorized) return `library:${libraryBlobRelPath(input.hash, ext)}`;
+  if (ext.toLowerCase() === 'svg') return null;
+  return `cindy-media://blobs/${input.hash}.${ext}`;
+}
+
 /** 单插件的库会话(vault + sql 绑定到同一根与 owner scope)。 */
 interface GhostLibrarySession {
+  ghostId: string;
   vault: LibraryVault;
   sql: LibrarySqlService;
   /** 会话创建时捕获的 owner scope key;每请求比对,变了就整会话作废。 */
@@ -41,6 +141,10 @@ interface GhostLibrarySession {
   locationKind: 'default' | 'custom';
   /** 自定义位置漂移(binding-moved/disk-missing):全部操作 unavailable。 */
   drift: 'binding-moved' | 'disk-missing' | null;
+  /** bind/unbind 代次;默认根为 0。不含绝对路径。 */
+  generation: number;
+  /** 库身份短码(default / g<generation>),不含绝对路径。 */
+  identity: string;
 }
 
 export interface GhostLibrarySlotDeps {
@@ -66,8 +170,20 @@ export interface GhostLibrarySlotDeps {
   showItemInFolder?(absPath: string): void;
   /** 系统另存为(生产接 dialog.showSaveDialog;标题/正文由主机拼装并带已核验插件名)。 */
   showSaveDialog?(opts: { defaultPath: string; ghostName: string }): Promise<{ canceled: boolean; filePath?: string }>;
+  /** 写系统剪贴板 PNG 位图(生产接 nativeImage + clipboard.writeImage;零 Electron 单测注入 fake)。 */
+  writeClipboardPng?(pngBytes: Buffer): Promise<void> | void;
   /** 可注入时钟(单测限速);默认 Date.now。 */
   now?(): number;
+  /**
+   * 库根 realpath 变化后同步当前 Mivo 会话 extraDirs。
+   * root 为 null 则撤槽。失败只记日志,不挡 library 主路径。
+   * 返回 granted = extraDirs 已挂上该库根;not-granted = 确定没挂上;
+   * superseded = 被更新一轮取代,不等于拆槽。void 仅留给旧单测 mock。
+   */
+  syncAgentReadonlyExtraDir?(
+    ghostId: string,
+    root: string | null,
+  ): Promise<boolean | 'granted' | 'not-granted' | 'superseded' | void>;
 }
 
 const fail = (errorCode: string, message: string): GhostPipeLibraryResult => ({ ok: false, errorCode, message });
@@ -80,8 +196,17 @@ export class GhostLibrarySlot {
   private readonly lastRevealAttemptAt = new Map<string, number>();
   /** 插件 id → 上次 saveAs 尝试时刻(按尝试记账;对齐 pick/confirm 骚扰钳制)。 */
   private readonly lastSaveAsAttemptAt = new Map<string, number>();
+  /** 插件 id → 上次 clipboardWrite 尝试时刻(按尝试记账;对齐 pick/confirm 骚扰钳制)。 */
+  private readonly lastClipboardWriteAttemptAt = new Map<string, number>();
   /** 全局另存为对话框在场标记(系统弹窗一次一个,不排队)。 */
   private saveAsDialogInFlight = false;
+  /**
+   * extraDirs 注入成功才握手 authorizedReadonly。系统槽同一时刻只有一个根,
+   * 所以只记当前 {ghostId, root};别人挂上或撤槽成功都要清掉这份记录。
+   */
+  private extraDirGrant: { ghostId: string; root: string } | null = null;
+  /** 最近一次显式 open 的插件;status 只给它复挂,别人 status 不得抢槽。 */
+  private extraDirOpenerGhostId: string | null = null;
 
   constructor(private readonly deps: GhostLibrarySlotDeps) {}
 
@@ -142,8 +267,8 @@ export class GhostLibrarySlot {
       const resolution = await this.deps.bindingStore.resolveLibraryRoot(ghostId);
       session = this.createSession(ghostId, resolution, scopeKey);
       this.sessions.set(ghostId, session);
-      // 会话建立即自动 open(幂等):消除"write 前忘 open"的脚枪;显式 open
-      // 操作仍有效,仅回状态。
+      // 会话建立即自动 open vault(幂等):消除"write 前忘 open"的脚枪。
+      // extraDirs 只在显式 open 时挂,status / 首次任意请求不得抢槽。
       if (session.drift === null) {
         await session.vault.open();
         // 重装自愈:能走到这里 = 插件已装入且启用,清掉卸载时留的 orphaned
@@ -151,6 +276,8 @@ export class GhostLibrarySlot {
         if (session.vault.getMeta()?.orphaned) {
           await session.vault.clearOrphaned().catch(() => {});
         }
+      } else if (this.extraDirGrant?.ghostId === ghostId) {
+        await this.syncAgentReadonlyExtraDir(ghostId, null);
       }
     }
     return session;
@@ -206,7 +333,85 @@ export class GhostLibrarySlot {
       betterSqliteModulePath: this.deps.betterSqliteModulePath,
       log: this.deps.log,
     });
-    return { vault, sql, ownerScopeKey: scopeKey, locationKind: resolution.kind, drift };
+    const record = 'record' in resolution ? resolution.record : undefined;
+    const generation = record?.generation ?? 0;
+    const identity = record ? `g${generation}` : 'default';
+    return {
+      ghostId,
+      vault,
+      sql,
+      ownerScopeKey: scopeKey,
+      locationKind: resolution.kind,
+      drift,
+      generation,
+      identity,
+    };
+  }
+
+  private isExtraDirGrantedFor(ghostId: string, root: string | null): boolean {
+    if (root === null || this.extraDirGrant === null) return false;
+    return this.extraDirGrant.ghostId === ghostId && this.extraDirGrant.root === root;
+  }
+
+  /** open/status 握手:已授权只读布尔 + 库代次/身份。谁问谁得,不回绝对路径。 */
+  private handshakeFields(
+    session: GhostLibrarySession,
+    state: 'ready' | 'readonly' | 'unavailable',
+  ): { authorizedReadonly: boolean; libraryGeneration: number; libraryIdentity: string } {
+    return {
+      authorizedReadonly:
+        this.isExtraDirGrantedFor(session.ghostId, session.vault.getRootDir())
+        && session.drift === null
+        && (state === 'ready' || state === 'readonly'),
+      libraryGeneration: session.generation,
+      libraryIdentity: session.identity,
+    };
+  }
+
+  private rememberExtraDirGrant(ghostId: string, root: string): void {
+    this.extraDirGrant = { ghostId, root };
+  }
+
+  private clearExtraDirGrant(ghostId?: string): void {
+    if (ghostId === undefined || this.extraDirGrant?.ghostId === ghostId) {
+      this.extraDirGrant = null;
+    }
+  }
+
+  private async syncAgentReadonlyExtraDir(ghostId: string, root: string | null): Promise<void> {
+    if (!this.deps.syncAgentReadonlyExtraDir) {
+      if (root === null) this.clearExtraDirGrant(ghostId);
+      else this.rememberExtraDirGrant(ghostId, root);
+      return;
+    }
+    try {
+      const granted = await this.deps.syncAgentReadonlyExtraDir(ghostId, root);
+      if (root === null) {
+        if (granted === 'superseded') return;
+        this.clearExtraDirGrant(ghostId);
+        return;
+      }
+      if (granted === true || granted === 'granted') {
+        this.rememberExtraDirGrant(ghostId, root);
+        return;
+      }
+      if (granted === 'superseded') {
+        this.deps.log?.warn('library extraDirs sync superseded', { ghostId });
+        return;
+      }
+      if (granted === false || granted === 'not-granted') {
+        this.clearExtraDirGrant(ghostId);
+        return;
+      }
+      // void:单测 mock 没回结果时,按 root 非空视为已实写。
+      this.rememberExtraDirGrant(ghostId, root);
+    } catch (error) {
+      this.clearExtraDirGrant(ghostId);
+      this.deps.log?.warn('library extraDirs sync failed', {
+        ghostId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   private async teardownSession(ghostId: string): Promise<void> {
@@ -215,6 +420,10 @@ export class GhostLibrarySlot {
     this.sessions.delete(ghostId);
     await session.sql.dispose().catch(() => {});
     await session.vault.invalidate().catch(() => {});
+    if (this.extraDirGrant?.ghostId === ghostId) {
+      await this.syncAgentReadonlyExtraDir(ghostId, null);
+    }
+    if (this.extraDirOpenerGhostId === ghostId) this.extraDirOpenerGhostId = null;
   }
 
   /** 停用/卸载/owner 切换收口:作废全部会话(commit 5 的生命周期接线点)。 */
@@ -298,27 +507,38 @@ export class GhostLibrarySlot {
       return fail('LIBRARY_UNAVAILABLE', `Library 不可用(${session.drift});请在 Cindy 设置中重新确认存储位置`);
     }
     if (session.drift !== null) {
-      return {
+      const drifted = {
         ok: true as const, op: op as 'open' | 'status', state: 'unavailable' as const,
         reason: session.drift, usedBytes: 0, fileCount: 0, location: 'custom' as const,
       };
+      return { ...drifted, ...this.handshakeFields(session, 'unavailable') } as GhostPipeLibraryResult;
     }
     const vault = session.vault;
     switch (op) {
       case 'open': {
         const r = await vault.open();
         if (!r.ok) return { ok: false, errorCode: r.errorCode, message: r.message };
-        return { ok: true, op: 'open', state: r.state, reason: r.reason ?? undefined, usedBytes: r.usedBytes, fileCount: r.fileCount, location: session.locationKind };
+        this.extraDirOpenerGhostId = ghostId;
+        await this.syncAgentReadonlyExtraDir(ghostId, vault.getRootDir());
+        const body = {
+          ok: true as const, op: 'open' as const, state: r.state, reason: r.reason ?? undefined,
+          usedBytes: r.usedBytes, fileCount: r.fileCount, location: session.locationKind,
+        };
+        return { ...body, ...this.handshakeFields(session, r.state) } as GhostPipeLibraryResult;
       }
       case 'status': {
         const r = await vault.status();
         if (!r.ok) return { ok: false, errorCode: r.errorCode, message: r.message };
-        return {
-          ok: true, op: 'status', state: r.state, reason: r.reason ?? undefined,
+        if (this.extraDirOpenerGhostId === ghostId) {
+          await this.syncAgentReadonlyExtraDir(ghostId, vault.getRootDir());
+        }
+        const body = {
+          ok: true as const, op: 'status' as const, state: r.state, reason: r.reason ?? undefined,
           usedBytes: r.usedBytes, fileCount: r.fileCount,
           diskFreeBytes: r.diskFreeBytes, softLimitBytes: r.softLimitBytes,
           softLimitExceeded: r.softLimitExceeded, location: r.location,
         };
+        return { ...body, ...this.handshakeFields(session, r.state) } as GhostPipeLibraryResult;
       }
       case 'read': {
         const r = await vault.read({ path: req.path, encoding: req.encoding, offset: req.offset, length: req.length });
@@ -485,6 +705,63 @@ export class GhostLibrarySlot {
         }
         const st = await fs.promises.stat(dest);
         return { ok: true, op: 'saveAs', cancelled: false, path: relPath, bytes: st.size };
+      }
+      case 'clipboardWrite': {
+        if (req.encoding !== 'base64') {
+          return fail('PATH_INVALID', 'clipboardWrite 只接受 encoding:"base64" 的 PNG 字节');
+        }
+        if (typeof req.content !== 'string') {
+          return fail('PATH_INVALID', 'clipboardWrite 需要 content(base64 PNG)');
+        }
+        if (req.content.length > (LIBRARY_CLIPBOARD_WRITE_MAX_BYTES * 4) / 3 + 8) {
+          return fail('TOO_LARGE', `clipboardWrite 内容超限(上限 ${LIBRARY_CLIPBOARD_WRITE_MAX_BYTES} 字节)`);
+        }
+        const pngBytes = decodeStrictBase64(req.content);
+        if (pngBytes === null) {
+          return fail('PATH_INVALID', 'clipboardWrite content 不是合法 base64');
+        }
+        if (pngBytes.byteLength === 0) {
+          return fail('PATH_INVALID', 'clipboardWrite 不能写入空字节');
+        }
+        if (pngBytes.byteLength > LIBRARY_CLIPBOARD_WRITE_MAX_BYTES) {
+          return fail('TOO_LARGE', `clipboardWrite 内容超限(上限 ${LIBRARY_CLIPBOARD_WRITE_MAX_BYTES} 字节)`);
+        }
+        if (!isPngBuffer(pngBytes)) {
+          return fail('PATH_INVALID', 'clipboardWrite 只接受 PNG 字节');
+        }
+        if (!this.deps.writeClipboardPng) {
+          return fail('UNSUPPORTED', '当前宿主不能写入系统剪贴板');
+        }
+
+        const now = this.deps.now?.() ?? Date.now();
+        const last = this.lastClipboardWriteAttemptAt.get(ghostId);
+        this.lastClipboardWriteAttemptAt.set(ghostId, now);
+        if (last !== undefined && now - last < GHOST_PICK_MIN_INTERVAL_MS) {
+          return fail('RATE_LIMITED', '写入剪贴板请求太频繁,稍后再试');
+        }
+        const stale = this.rejectIfSessionStale(
+          ghostId,
+          session,
+          '账号已切换,写入剪贴板已取消',
+        );
+        if (stale) return stale;
+        try {
+          await this.deps.writeClipboardPng(pngBytes);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.deps.log?.warn('ghost library clipboardWrite failed', { ghostId, err: message });
+          if (message === CLIPBOARD_NO_HOST_WINDOW) {
+            return fail('UNSUPPORTED', '当前没有可挂靠的宿主窗口,无法写入系统剪贴板');
+          }
+          return fail('INTERNAL', '写入系统剪贴板失败');
+        }
+        const afterWrite = this.rejectIfSessionStale(
+          ghostId,
+          session,
+          '账号已切换,写入剪贴板已取消',
+        );
+        if (afterWrite) return afterWrite;
+        return { ok: true, op: 'clipboardWrite', bytes: pngBytes.byteLength };
       }
       case 'db.open': {
         const resolved = await this.resolveDbPath(session, req.dbPath);

@@ -250,7 +250,8 @@
   },
   "shareImage": {
     "title": "分享对话",
-    "selectedCount": "已选择 {{count}} 条消息",
+    "subtitle_one": "已选 {{count}} 条消息",
+    "subtitle_other": "已选 {{count}} 条消息",
     "selectAll": "全选",
     "clearAll": "取消全选",
     "cancel": "取消分享",
@@ -267,6 +268,14 @@
     "composerPlaceholder": "今天我们做点什么呢~",
     "voiceSelectDeviceFirst": "请选择设备后再使用语音输入。",
     "creatingSession": "正在创建任务",
+    "slowSend": {
+      "preparing": "正在准备发送…",
+      "uploading": "正在上传附件…",
+      "connecting": "正在连接电脑…",
+      "checkingModel": "正在检查模型设置…",
+      "creating": "正在创建任务…",
+      "sending": "正在发送消息…"
+    },
     "createAndSend": "创建任务并发送首条消息",
     "modelAccessibility": "模型：{{model}}",
     "voiceInput": "语音输入",
@@ -322,6 +331,7 @@
     "worktreeBranchSaving": "正在同步所选分支…",
     "worktreeBranchSyncFailed": "无法确认已保存的源分支，请重新选择分支",
     "worktreeSettingsSaving": "正在同步 worktree 设置…",
+    "worktreeSettingsSyncFailed": "无法确认已保存的 worktree 设置，请重试开关",
     "worktreeBranchesRetry": "无法读取分支，点按重试",
     "worktreeDetecting": "检测环境中…",
     "worktreeRecovering": "连接恢复中，正在自动重试…",

@@ -118,12 +118,17 @@ import type {
   NormalizedToolDiff,
   NormalizedToolMedia,
 } from '@/session/messageNormalize';
+import type {
+  MobileToolInputDetail,
+  MobileToolInputProjection,
+} from '@/session/messageToolPayloadProjection';
 import {
   buildAttachmentPayload,
   buildDiffPayload,
   buildFilePayload,
   buildMediaPayload,
   buildMermaidPayload,
+  buildTextPayload,
   buildToolResultPayload,
   formatDiffPayloadView,
   payloadMediaKindLabel,
@@ -181,12 +186,14 @@ import {
   parseMobileMarkdownIncremental,
   parseMobileMarkdownInlines,
   type MobileMarkdownParseResult,
+  type MobileMarkdownBlock,
   type MobileMarkdownBlockGroup,
   type MobileMarkdownInline,
   type MobileMarkdownTextRunGroupingOptions,
 } from '@/session/messageMarkdown';
+import { MarkdownBlockContent } from '@/session/MarkdownBlockContent';
+import { useMarkdownSessionLinkTitles } from '@/session/useMarkdownSessionLinkTitles';
 import {
-  extractSessionLinkIds,
   isCindyDeepLinkUrl,
   parseProjectDeepLinkUrl,
   parseSessionDeepLinkUrl,
@@ -296,6 +303,7 @@ import type {
   MobileMediaPlayerStatus,
 } from '@/session/mediaPlayerWebViewHtml';
 import { formatMobileSystemCard } from '@/session/systemCard';
+import { MobileBoundaryNotice } from '@/session/MobileBoundaryNotice';
 import {
   getMobileAutoResumePresentation,
   isMobileAutoResumeRowInFlight,
@@ -305,6 +313,7 @@ import type { ContinuationInFlightProjectionCapability } from '@/session/types';
 import {
   projectMobileWorkActivities,
   type MobileProjectedToolActivity,
+  sameMobileWorkToolActivity,
 } from '@/session/workActivityProjection';
 import { logUnhandledRenderItem } from '@/session/assertNever';
 import type { OrcaCollabCard as OrcaCollabCardModel } from '@/session/orcaCollab';
@@ -335,9 +344,12 @@ import {
 import {
   captureMobileHistoryAnchor,
   isMobileHistoryAnchorSettled,
+  mobileHistoryAnchorCorrectionStatus,
+  mobileHistoryPrependUsesAppOwnedAnchor,
   mobileHistoryTopOffsetAdjustment,
   resolveMobileHistoryAnchorOffset,
   type MobileHistoryAnchor,
+  type MobileHistoryAnchorPendingCorrection,
   type MobileHistoryAnchorResolveState,
 } from '@/session/messageHistoryAnchor';
 import {
@@ -400,6 +412,9 @@ const MOBILE_MESSAGE_ESTIMATED_ITEM_SIZE = 100;
 const MOBILE_HISTORY_ANCHOR_VERIFY_MAX_FRAMES = 180;
 const MOBILE_HISTORY_ANCHOR_VERIFY_MAX_MS = 3000;
 const MOBILE_HISTORY_ANCHOR_STABLE_FRAMES = 2;
+const MOBILE_HISTORY_PREPEND_USES_APP_OWNED_ANCHOR = mobileHistoryPrependUsesAppOwnedAnchor(
+  Platform.OS,
+);
 const MOBILE_SCROLL_HISTORY_EVALUATION_INTERVAL_MS = 64;
 const ANDROID_SELECTABLE_TEXT_RUN_MAX_BLOCKS = 12;
 const ANDROID_SELECTABLE_TEXT_RUN_MAX_UTF16_LENGTH = 1800;
@@ -440,11 +455,14 @@ interface MobileHistoryPrependTransaction {
   continueAfterRegroup: boolean;
   generation: number;
   pageCommitted: boolean;
+  pendingCorrection: MobileHistoryAnchorPendingCorrection | null;
   promiseSettled: boolean;
   startItems: readonly MobileMessageRenderItem[];
   startProgressKey: string | null;
   userInitiated: boolean;
   userControlledAfterCommit: boolean;
+  userControlledDuringRequest: boolean;
+  userHandoffPending: boolean;
   verifyDeadlineAt: number;
 }
 // 「跳到底部」浮标直径:比 composer 里的语音按钮(28)大一档但不压过它,Telegram 同款层级感。
@@ -589,6 +607,7 @@ interface MessageActions {
   onLoadEarlier?: () => void | Promise<void>;
   onOpenForkOrigin?: () => void;
   onOpenPayload?: (payload: MessagePayload) => void;
+  onLoadToolInput?: (ref: MobileToolInputProjection) => Promise<MobileToolInputDetail>;
   onBlockingOverlayChange?: (blocked: boolean) => void;
   onMessageActionSheetOpenChange?: (clientId: string, open: boolean) => void;
   /** 正文里会话深链 chip(xdt-maker://session/…)点击回调,app 内跳转。 */
@@ -625,11 +644,13 @@ export function MessageRenderer({
   focusedItemKey,
   followLatestRequestKey,
   items,
+  itemsStructureKey,
   onCopyMessageLink,
   onAddMessageToComposer,
   onForkMessage,
   onDeleteMessage,
   onLoadEarlier,
+  onLoadToolInput,
   onOpenForkOrigin,
   onBlockingOverlayChange,
   onOpenSessionLink,
@@ -671,6 +692,8 @@ export function MessageRenderer({
   focusedRequestKey?: number | string | null;
   followLatestRequestKey?: number | string | null;
   items: readonly MobileMessageRenderItem[];
+  /** Stable while streaming only changes row content; structural list derivations key off this. */
+  itemsStructureKey?: unknown;
   /** Oldest loaded host cursor; synthetic cards must not mask successful history prepends. */
   loadEarlierProgressKey?: string | null;
   emptyTestID?: string;
@@ -709,8 +732,17 @@ export function MessageRenderer({
   const { colors } = useTheme();
   const { t } = useTranslation();
   const styles = useThemedStyles(makeStyles);
-  const firstUserMessageClientId = findFirstUserMessageClientId(items);
-  const lastUserInputClientId = findLastUserInputClientId(items);
+  const itemStructureIdentity = itemsStructureKey ?? items;
+  const itemsForStructureRef = useRef(items);
+  itemsForStructureRef.current = items;
+  const firstUserMessageClientId = useMemo(
+    () => findFirstUserMessageClientId(itemsForStructureRef.current),
+    [itemStructureIdentity],
+  );
+  const lastUserInputClientId = useMemo(
+    () => findLastUserInputClientId(itemsForStructureRef.current),
+    [itemStructureIdentity],
+  );
   const focusedItemKeyRef = useRef(focusedItemKey);
   focusedItemKeyRef.current = focusedItemKey;
   const listRef = useRef<LegendListRef>(null);
@@ -759,16 +791,15 @@ export function MessageRenderer({
   const readingOlderRef = useRef(false);
   // 每次补页分配 generation：旧会话 / 旧请求的异步 settle 不得清掉新请求的抑制态。
   const readingOlderRequestGenerationRef = useRef(0);
-  // data-change anchoring is app-owned instead of delegated to Android MVCP. The transaction
-  // keeps the old visible row pinned until the new page, layout, and non-animated correction all
-  // settle; this removes the frame where cells move before native contentOffset catches up.
+  // Android data-change anchoring is app-owned; iOS keeps LegendList/RN's atomic native MVCP.
+  // The shared transaction also suppresses follow-to-end until the page commit has settled.
   const historyPrependTransactionRef = useRef<MobileHistoryPrependTransaction | null>(null);
   const historyAnchorVerifyFrameRef = useRef<number | null>(null);
   const queuedLoadEarlierRef = useRef(false);
   const queuedLoadEarlierFlushFrameRef = useRef<number | null>(null);
-  // Keep native MVCP for ordinary data/size changes, but turn it fully off before starting a
-  // history request. LegendList maps either `data` or `size` to the same RN ScrollView prop, so
-  // `{ data:false, size:true }` would still race the app-owned prepend correction on Android.
+  // On Android, keep native MVCP for ordinary data/size changes but turn it fully off before a
+  // history request. LegendList maps either flag to the same RN ScrollView prop, so leaving size on
+  // would still race the app-owned correction. iOS never flips this state.
   const [historyPrependNativeMvcpDisabled, setHistoryPrependNativeMvcpDisabled] = useState(false);
   const historyPrependNativeMvcpDisabledRef = useRef(historyPrependNativeMvcpDisabled);
   historyPrependNativeMvcpDisabledRef.current = historyPrependNativeMvcpDisabled;
@@ -784,6 +815,9 @@ export function MessageRenderer({
   const programmaticScrollSettleAtRef = useRef(0);
   const previousFollowLatestRequestKeyRef = useRef(followLatestRequestKey);
   const previousItemKeysRef = useRef<readonly string[]>([]);
+  // LegendList updates getState().scroll optimistically before an imperative native scroll lands.
+  // This sequence advances only from ScrollView onScroll and is the ack source for Android prepend.
+  const nativeScrollEventSequenceRef = useRef(0);
   const scrollMetricsRef = useRef<MessageScrollMetrics>({
     contentHeight: 0,
     offsetY: 0,
@@ -875,6 +909,7 @@ export function MessageRenderer({
     }
     previousItemKeysRef.current = [];
     firstVisibleIndexRef.current = 0;
+    nativeScrollEventSequenceRef.current = 0;
     scrollMetricsRef.current = { contentHeight: 0, offsetY: 0, viewportHeight: 0 };
     followEndPinStateRef.current = createMobileFollowEndPinState();
     initialAnchorDoneRef.current = false;
@@ -1003,12 +1038,20 @@ export function MessageRenderer({
     });
   }, []);
 
-  const captureCurrentHistoryAnchor = useCallback((): MobileHistoryAnchor | null => {
+  const captureCurrentHistoryAnchor = useCallback((useNativeViewport = false): MobileHistoryAnchor | null => {
     const listState = listRef.current?.getState();
+    const nativeMetrics = scrollMetricsRef.current;
+    const canUseNativeViewport = useNativeViewport && nativeMetrics.viewportHeight > 0;
     return listState
       ? captureMobileHistoryAnchor(
         {
           ...listState,
+          // A pending LegendList command can move `scroll` and the cached visible range before
+          // Android's ScrollView follows. Once a finger owns the viewport, derive the anchor from
+          // the last native offset and force the position lookup to ignore that optimistic range.
+          ...(canUseNativeViewport
+            ? { scroll: nativeMetrics.offsetY, start: -1 }
+            : {}),
           topOffsetAdjustment: getCurrentHistoryTopOffsetAdjustment(),
         },
         (item) => (item as MobileMessageRenderItem).key,
@@ -1026,7 +1069,7 @@ export function MessageRenderer({
     }
     regroupedHistoryContinuationRef.current = transaction.continueAfterRegroup
       && transaction.userInitiated
-      && !transaction.userControlledAfterCommit;
+      && !transaction.userControlledDuringRequest;
     historyPrependTransactionRef.current = null;
     readingOlderRef.current = false;
     setHistoryPrependNativeMvcpDisabled(false);
@@ -1037,24 +1080,46 @@ export function MessageRenderer({
     const transaction = historyPrependTransactionRef.current;
     if (!transaction || transaction.generation !== generation) return;
     if (loadingEarlierRef.current || !transaction.promiseSettled) return;
+    // A committed page still needs its anchor correction acknowledged; that case is covered by
+    // `anchorStable` below. Only hold the handoff open while the finger or momentum still owns the
+    // viewport, otherwise a page that resolves with no coordinate change could never release the
+    // transaction and native MVCP would stay off for the rest of the session.
+    if (
+      transaction.userHandoffPending
+      && (
+        isDraggingRef.current
+        || isMomentumScrollingRef.current
+        || historyTouchStartYRef.current !== null
+      )
+    ) return;
     if (transaction.pageCommitted && !transaction.anchorStable) return;
     finishHistoryPrependTransaction(generation);
   }, [finishHistoryPrependTransaction]);
 
-  const handoffHistoryPrependToUser = useCallback(() => {
+  // `viewportTakenOver` separates «a finger is on the ScrollView» from «the reader actually moved
+  // the viewport». Both must stop imperative corrections, but only the latter may cancel the
+  // regroup-only continuation: a bare tap moves nothing, and treating it as a takeover strands the
+  // reader at the top when a page merely expanded the collapsed first work group.
+  const handoffHistoryPrependToUser = useCallback((viewportTakenOver = true) => {
     const transaction = historyPrependTransactionRef.current;
     if (!transaction) return;
-    const currentAnchor = captureCurrentHistoryAnchor();
+    if (viewportTakenOver) transaction.userControlledDuringRequest = true;
+    if (!MOBILE_HISTORY_PREPEND_USES_APP_OWNED_ANCHOR) return;
+    transaction.userHandoffPending = true;
+    const currentAnchor = captureCurrentHistoryAnchor(true);
     if (currentAnchor) transaction.anchor = currentAnchor;
     if (!transaction.pageCommitted) return;
     transaction.userControlledAfterCommit = true;
-    transaction.anchorStable = true;
+    transaction.anchorStable = false;
+    // An imperative scroll already handed to native cannot be cancelled reliably. Stop the JS
+    // verifier from adding more commands while the finger/momentum owns the viewport, keep MVCP
+    // disabled, and reconcile from native metrics after that gesture ends.
+    transaction.pendingCorrection = null;
     if (historyAnchorVerifyFrameRef.current !== null) {
       cancelAnimationFrame(historyAnchorVerifyFrameRef.current);
       historyAnchorVerifyFrameRef.current = null;
     }
-    maybeFinishHistoryPrependTransaction(transaction.generation);
-  }, [captureCurrentHistoryAnchor, maybeFinishHistoryPrependTransaction]);
+  }, [captureCurrentHistoryAnchor]);
 
   const cancelHistoryPrependTransaction = useCallback(() => {
     readingOlderRequestGenerationRef.current += 1;
@@ -1074,6 +1139,7 @@ export function MessageRenderer({
   }, []);
 
   const scheduleHistoryAnchorRestore = useCallback((generation: number) => {
+    if (!MOBILE_HISTORY_PREPEND_USES_APP_OWNED_ANCHOR) return;
     const transaction = historyPrependTransactionRef.current;
     if (
       !transaction
@@ -1113,34 +1179,69 @@ export function MessageRenderer({
         : null;
 
       if (targetOffset !== null && listState) {
-        const currentOffset = listState.scroll;
-        const settled = isMobileHistoryAnchorSettled(
-          currentOffset,
-          targetOffset,
-          previousTargetOffset,
-          MOBILE_ANCHOR_VERIFY_TOLERANCE,
-        );
-        // Only the anchor row's resolved position matters here. A running session can keep
-        // growing below the reader while history is settling; treating every tail size change as
-        // anchor instability keeps this verifier alive for the full retry bound and needlessly
-        // churns cells/GC. If a layout change above the anchor matters, targetOffset changes and
-        // the two-frame stability check resets on its own.
-        const nextStableFrames = settled ? stableFrames + 1 : 0;
-        if (Math.abs(currentOffset - targetOffset) > MOBILE_ANCHOR_VERIFY_TOLERANCE) {
-          scrollToOffsetProgrammatically(targetOffset, false);
-        }
-        if (nextStableFrames >= MOBILE_HISTORY_ANCHOR_STABLE_FRAMES) {
-          historyAnchorVerifyFrameRef.current = null;
-          currentTransaction.anchorStable = true;
-          maybeFinishHistoryPrependTransaction(generation);
-          return;
-        }
-        if (withinDeadline && attempts < MOBILE_HISTORY_ANCHOR_VERIFY_MAX_FRAMES) {
-          historyAnchorVerifyFrameRef.current = requestAnimationFrame(() => {
+        // LegendList moves getState().scroll to an imperative target before the native ScrollView
+        // receives it. Using that optimistic value here used to self-confirm the correction in two
+        // frames, release MVCP, and leave Android briefly rendering the target cell window at the
+        // old physical offset. Only onScroll-backed metrics can prove the viewport actually moved.
+        const currentOffset = scrollMetricsRef.current.offsetY;
+        const pendingCorrection = currentTransaction.pendingCorrection;
+        const correctionStatus = pendingCorrection
+          ? mobileHistoryAnchorCorrectionStatus(pendingCorrection, {
+              nativeOffset: currentOffset,
+              nativeScrollSequence: nativeScrollEventSequenceRef.current,
+            }, MOBILE_ANCHOR_VERIFY_TOLERANCE)
+          : null;
+        const waitingForNativeCorrection = correctionStatus === 'waiting'
+          && Math.abs(currentOffset - targetOffset) > MOBILE_ANCHOR_VERIFY_TOLERANCE;
+        if (waitingForNativeCorrection) {
+          // Keep one command in flight while no later native event has arrived. Once a later event
+          // misses, the branch below clears this command and retries the latest resolved target at
+          // most once per native event, rather than replacing the command on every animation frame.
+          if (withinDeadline && attempts < MOBILE_HISTORY_ANCHOR_VERIFY_MAX_FRAMES) {
+            historyAnchorVerifyFrameRef.current = requestAnimationFrame(() => {
+              historyAnchorVerifyFrameRef.current = null;
+              step(attempts + 1, 0, targetOffset);
+            });
+            return;
+          }
+        } else {
+          if (pendingCorrection) currentTransaction.pendingCorrection = null;
+          const settled = isMobileHistoryAnchorSettled(
+            currentOffset,
+            targetOffset,
+            previousTargetOffset,
+            MOBILE_ANCHOR_VERIFY_TOLERANCE,
+          );
+          // Only the anchor row's resolved position matters here. A running session can keep
+          // growing below the reader while history is settling; treating every tail size change as
+          // anchor instability keeps this verifier alive for the full retry bound and needlessly
+          // churns cells/GC. If a layout change above the anchor matters, targetOffset changes and
+          // the two-frame stability check resets on its own.
+          const nextStableFrames = settled ? stableFrames + 1 : 0;
+          if (
+            Math.abs(currentOffset - targetOffset) > MOBILE_ANCHOR_VERIFY_TOLERANCE
+            && withinDeadline
+            && attempts < MOBILE_HISTORY_ANCHOR_VERIFY_MAX_FRAMES
+          ) {
+            currentTransaction.pendingCorrection = {
+              requestedAfterNativeScrollSequence: nativeScrollEventSequenceRef.current,
+              targetOffset,
+            };
+            scrollToOffsetProgrammatically(targetOffset, false);
+          }
+          if (nextStableFrames >= MOBILE_HISTORY_ANCHOR_STABLE_FRAMES) {
             historyAnchorVerifyFrameRef.current = null;
-            step(attempts + 1, nextStableFrames, targetOffset);
-          });
-          return;
+            currentTransaction.anchorStable = true;
+            maybeFinishHistoryPrependTransaction(generation);
+            return;
+          }
+          if (withinDeadline && attempts < MOBILE_HISTORY_ANCHOR_VERIFY_MAX_FRAMES) {
+            historyAnchorVerifyFrameRef.current = requestAnimationFrame(() => {
+              historyAnchorVerifyFrameRef.current = null;
+              step(attempts + 1, nextStableFrames, targetOffset);
+            });
+            return;
+          }
         }
       } else if (withinDeadline && attempts < MOBILE_HISTORY_ANCHOR_VERIFY_MAX_FRAMES) {
         historyAnchorVerifyFrameRef.current = requestAnimationFrame(() => {
@@ -1150,47 +1251,12 @@ export function MessageRenderer({
         return;
       }
 
-      if (targetOffset !== null && listState) {
-        // Complex pages can keep refining estimates beyond the retry window even though the anchor
-        // key remains valid. End with two bounded, non-animated corrections instead of warning and
-        // re-enabling native MVCP against a stale offset. The history-intent guard keeps these
-        // resulting scroll events from being mistaken for a user return to the latest edge.
-        scrollToOffsetProgrammatically(targetOffset, false);
-        historyAnchorVerifyFrameRef.current = requestAnimationFrame(() => {
-          const finalTransaction = historyPrependTransactionRef.current;
-          if (
-            !finalTransaction
-            || finalTransaction.generation !== generation
-            || finalTransaction.userControlledAfterCommit
-          ) return;
-          const finalState = listRef.current?.getState();
-          const finalTarget = finalTransaction.anchor && finalState
-            ? resolveMobileMessageHistoryAnchorOffset(
-              finalTransaction.anchor,
-              finalState,
-              getCurrentHistoryTopOffsetAdjustment(),
-            )
-            : null;
-          if (finalTarget !== null) scrollToOffsetProgrammatically(finalTarget, false);
-          historyAnchorVerifyFrameRef.current = requestAnimationFrame(() => {
-            historyAnchorVerifyFrameRef.current = null;
-            const settledTransaction = historyPrependTransactionRef.current;
-            if (
-              !settledTransaction
-              || settledTransaction.generation !== generation
-              || settledTransaction.userControlledAfterCommit
-            ) return;
-            settledTransaction.anchorStable = true;
-            maybeFinishHistoryPrependTransaction(generation);
-          });
-        });
-        return;
-      }
-
-      // The key should survive a prepend. Keep an actually unresolved page bounded so malformed
-      // host data cannot lock history browsing forever; follow-to-latest remains disabled.
-      console.warn('[message-list] history prepend anchor could not be resolved before the retry bound');
+      // Do not fire unacknowledged "final" scrolls and immediately re-enable native MVCP. That old
+      // fallback raced its still-pending imperative command and amplified the visible bounce. Keep
+      // the transaction bounded, warn once, and leave the reader detached from follow-to-latest.
+      console.warn('[message-list] history prepend anchor did not settle before the retry bound');
       historyAnchorVerifyFrameRef.current = null;
+      currentTransaction.pendingCorrection = null;
       currentTransaction.anchorStable = true;
       maybeFinishHistoryPrependTransaction(generation);
     };
@@ -1207,6 +1273,7 @@ export function MessageRenderer({
   ]);
 
   const restoreHistoryAnchorOnce = useCallback((generation: number) => {
+    if (!MOBILE_HISTORY_PREPEND_USES_APP_OWNED_ANCHOR) return;
     const transaction = historyPrependTransactionRef.current;
     if (
       !transaction
@@ -1223,12 +1290,50 @@ export function MessageRenderer({
       : null;
     if (
       targetOffset !== null
-      && listState
-      && Math.abs(listState.scroll - targetOffset) > MOBILE_ANCHOR_VERIFY_TOLERANCE
+      && Math.abs(scrollMetricsRef.current.offsetY - targetOffset) > MOBILE_ANCHOR_VERIFY_TOLERANCE
     ) {
       scrollToOffsetProgrammatically(targetOffset, false);
     }
   }, [getCurrentHistoryTopOffsetAdjustment, scrollToOffsetProgrammatically]);
+
+  const scheduleHistoryPrependUserHandoffSettle = useCallback(() => {
+    if (!MOBILE_HISTORY_PREPEND_USES_APP_OWNED_ANCHOR) return;
+    const transaction = historyPrependTransactionRef.current;
+    if (!transaction || !transaction.userHandoffPending) return;
+    if (historyAnchorVerifyFrameRef.current !== null) return;
+    const generation = transaction.generation;
+    // onScrollEndDrag can be followed by onMomentumScrollBegin. Defer one frame so momentum gets
+    // ownership before deciding whether it is safe to resume imperative anchor verification.
+    historyAnchorVerifyFrameRef.current = requestAnimationFrame(() => {
+      historyAnchorVerifyFrameRef.current = null;
+      const currentTransaction = historyPrependTransactionRef.current;
+      if (
+        !currentTransaction
+        || currentTransaction.generation !== generation
+        || isDraggingRef.current
+        || isMomentumScrollingRef.current
+        || historyTouchStartYRef.current !== null
+      ) return;
+
+      if (currentTransaction.pageCommitted) {
+        currentTransaction.userHandoffPending = false;
+        currentTransaction.userControlledAfterCommit = false;
+        currentTransaction.pendingCorrection = null;
+        currentTransaction.verifyDeadlineAt = 0;
+        scheduleHistoryAnchorRestore(generation);
+        return;
+      }
+      if (currentTransaction.promiseSettled && !loadingEarlierRef.current) {
+        // A failed, empty, or duplicate page changed no coordinates. Waiting until the gesture
+        // ended still guarantees that an older in-flight correction cannot race MVCP re-enable.
+        currentTransaction.userHandoffPending = false;
+        currentTransaction.userControlledAfterCommit = false;
+        currentTransaction.pendingCorrection = null;
+        currentTransaction.anchorStable = true;
+        maybeFinishHistoryPrependTransaction(generation);
+      }
+    });
+  }, [maybeFinishHistoryPrependTransaction, scheduleHistoryAnchorRestore]);
 
   // 贴底跟随的落底校验/补滚环:两条手动补滚路径——「跳到最新」(followLatestRequestKey)
   // 与 handleContentSize 的贴底追赶——都只发一次命令式 scrollToEnd,不校验是否真的到达内容
@@ -1318,7 +1423,7 @@ export function MessageRenderer({
   // 与 main 保持一致：完整历史从首次挂载起就在同一个 LegendList 中，屏外 cell 交给
   // LegendList 虚拟化/回收。不能用业务尾窗代替完整数据，否则短尾窗未撑满首屏时
   // Android 无法产生有效滚动，运行中任务会重现“上半屏空白且历史不可拖动”。
-  const listData = useMemo(() => [...items], [items]);
+  const listData = items;
   const listDataRef = useRef(listData);
   listDataRef.current = listData;
   const prevListLengthRef = useRef(listData.length);
@@ -1334,7 +1439,10 @@ export function MessageRenderer({
     }
     prevListLengthRef.current = listData.length;
   }
-  const itemKeys = useMemo(() => listData.map((item) => item.key), [listData]);
+  const itemKeys = useMemo(
+    () => listDataRef.current.map((item) => item.key),
+    [itemStructureIdentity],
+  );
   const itemKeysSignature = useMemo(
     () => mobileMessageListKeysSignature(itemKeys),
     [itemKeys],
@@ -1356,6 +1464,26 @@ export function MessageRenderer({
           transaction.startItems,
           listDataRef.current,
         );
+      if (!MOBILE_HISTORY_PREPEND_USES_APP_OWNED_ANCHOR) {
+        // iOS keeps LegendList/RN MVCP enabled for the data commit. Do not follow its atomic native
+        // correction with an application scroll; only retain the transaction's follow-to-end guard.
+        transaction.anchorStable = true;
+        maybeFinishHistoryPrependTransaction(transaction.generation);
+        return;
+      }
+      if (transaction.userControlledDuringRequest) {
+        // A second gesture can begin while the remote page is in flight. Keep native MVCP disabled
+        // and issue no app scroll while the finger/momentum owns the viewport. Gesture-end resumes
+        // verification from the latest native-captured anchor and waits for its native ack.
+        transaction.userControlledAfterCommit = true;
+        transaction.anchorStable = false;
+        transaction.pendingCorrection = null;
+        // Re-arm the handoff explicitly: the gesture that took over may already have ended, in
+        // which case the scheduled settle below is the only path back to anchor verification.
+        transaction.userHandoffPending = true;
+        scheduleHistoryPrependUserHandoffSettle();
+        return;
+      }
       scheduleHistoryAnchorRestore(transaction.generation);
       maybeFinishHistoryPrependTransaction(transaction.generation);
       return;
@@ -1373,6 +1501,7 @@ export function MessageRenderer({
     loadingEarlier,
     maybeFinishHistoryPrependTransaction,
     scheduleHistoryAnchorRestore,
+    scheduleHistoryPrependUserHandoffSettle,
   ]);
   // 只认行身份（追加 / 换行 / 重排）。流式改内容会换 items 引用，但不能续安静窗。
   useEffect(() => {
@@ -1466,6 +1595,7 @@ export function MessageRenderer({
     onEnterShareSelection,
     onShareableMessageViewChange: handleShareableMessageViewChange,
     onOpenPayload: setPayload,
+    onLoadToolInput,
     onMessageActionSheetOpenChange: handleMessageActionSheetOpenChange,
     onResolveRemoteMedia,
     // 待发送气泡(pending_send 项)的展开态与队列操作:漏了这一项 actions.pendingSend 就是
@@ -1496,6 +1626,7 @@ export function MessageRenderer({
     onDeleteMessage,
     onForkMessage,
     onOpenForkOrigin,
+    onLoadToolInput,
     onOpenSessionLink,
     onPreviewRewind,
     onEnterShareSelection,
@@ -1733,7 +1864,7 @@ export function MessageRenderer({
     const generation = readingOlderRequestGenerationRef.current + 1;
     readingOlderRequestGenerationRef.current = generation;
     const listState = listRef.current?.getState();
-    const anchor = listState
+    const anchor = MOBILE_HISTORY_PREPEND_USES_APP_OWNED_ANCHOR && listState
       ? captureMobileHistoryAnchor(
         {
           ...listState,
@@ -1745,15 +1876,18 @@ export function MessageRenderer({
       : null;
     historyPrependTransactionRef.current = {
       anchor,
-      anchorStable: false,
+      anchorStable: !MOBILE_HISTORY_PREPEND_USES_APP_OWNED_ANCHOR,
       continueAfterRegroup: false,
       generation,
       pageCommitted: false,
+      pendingCorrection: null,
       promiseSettled: false,
       startItems: listDataRef.current,
       startProgressKey: historyProgressKey,
       userInitiated: userScrollForOlderRef.current,
       userControlledAfterCommit: false,
+      userControlledDuringRequest: false,
+      userHandoffPending: false,
       verifyDeadlineAt: 0,
     };
     readingOlderRef.current = true;
@@ -1791,9 +1925,13 @@ export function MessageRenderer({
       || isMomentumScrollingRef.current
       || historyTouchStartYRef.current !== null
     ) return;
-    // The request must not start until a committed render has removed RN's native MVCP prop.
-    // Otherwise a fast local/relay response can prepend before the prop update reaches Android.
-    if (!historyPrependNativeMvcpDisabledRef.current) {
+    // Android must not start until a committed render removes RN's native MVCP prop. Otherwise a
+    // fast local/relay response can prepend before that prop update lands. iOS keeps native MVCP
+    // throughout and can start immediately once the user's gesture is no longer active.
+    if (
+      MOBILE_HISTORY_PREPEND_USES_APP_OWNED_ANCHOR
+      && !historyPrependNativeMvcpDisabledRef.current
+    ) {
       setHistoryPrependNativeMvcpDisabled(true);
       return;
     }
@@ -1943,6 +2081,7 @@ export function MessageRenderer({
   // (readingOlderRef)期间禁止方向性恢复——load-earlier prepend 的 mVCP 补偿会产生
   // 程序化向下增量,短会话里会被误判成「用户滑回底部」。
   const handleScroll = useCallback((event: NativeSyntheticEvent<NativeScrollEvent>) => {
+    nativeScrollEventSequenceRef.current += 1;
     const metrics = {
       contentHeight: event.nativeEvent.contentSize.height,
       offsetY: event.nativeEvent.contentOffset.y,
@@ -2024,7 +2163,10 @@ export function MessageRenderer({
     isMomentumScrollingRef.current = false;
     historyTouchStartYRef.current = event.nativeEvent.pageY;
     historyTouchTriggeredRef.current = false;
-  }, []);
+    // Touch-start only means the finger holds the ScrollView; it is not a viewport takeover yet.
+    // maybeTriggerHistoryTouch / onScrollBeginDrag report the real move once it clears the dead zone.
+    handoffHistoryPrependToUser(false);
+  }, [handoffHistoryPrependToUser]);
 
   const maybeTriggerHistoryTouch = useCallback((pageY: number) => {
     const startY = historyTouchStartYRef.current;
@@ -2050,14 +2192,20 @@ export function MessageRenderer({
     maybeTriggerHistoryTouch(event.nativeEvent.pageY);
     historyTouchStartYRef.current = null;
     historyTouchTriggeredRef.current = false;
+    scheduleHistoryPrependUserHandoffSettle();
     scheduleQueuedLoadEarlierFlush();
-  }, [maybeTriggerHistoryTouch, scheduleQueuedLoadEarlierFlush]);
+  }, [
+    maybeTriggerHistoryTouch,
+    scheduleHistoryPrependUserHandoffSettle,
+    scheduleQueuedLoadEarlierFlush,
+  ]);
 
   const handleHistoryTouchCancel = useCallback(() => {
     historyTouchStartYRef.current = null;
     historyTouchTriggeredRef.current = false;
+    scheduleHistoryPrependUserHandoffSettle();
     scheduleQueuedLoadEarlierFlush();
-  }, [scheduleQueuedLoadEarlierFlush]);
+  }, [scheduleHistoryPrependUserHandoffSettle, scheduleQueuedLoadEarlierFlush]);
 
   // 用户开始拖动 → 标记「上翻意图」,放行自动加载更早(onScrollBeginDrag 仅用户手势触发,
   // 程序化 scrollToEnd 不会触发,故不会误置);同时记录拖动起点 offset,供
@@ -2091,8 +2239,13 @@ export function MessageRenderer({
     dragStartOffsetYRef.current = null;
     refreshPreviousUserTarget();
     // Wait one frame so Android can report whether this drag transitioned into momentum.
+    scheduleHistoryPrependUserHandoffSettle();
     scheduleQueuedLoadEarlierFlush();
-  }, [refreshPreviousUserTarget, scheduleQueuedLoadEarlierFlush]);
+  }, [
+    refreshPreviousUserTarget,
+    scheduleHistoryPrependUserHandoffSettle,
+    scheduleQueuedLoadEarlierFlush,
+  ]);
 
   const handleMomentumScrollBegin = useCallback(() => {
     isMomentumScrollingRef.current = true;
@@ -2101,8 +2254,13 @@ export function MessageRenderer({
   const handleMomentumScrollEnd = useCallback(() => {
     isMomentumScrollingRef.current = false;
     refreshPreviousUserTarget();
+    scheduleHistoryPrependUserHandoffSettle();
     scheduleQueuedLoadEarlierFlush();
-  }, [refreshPreviousUserTarget, scheduleQueuedLoadEarlierFlush]);
+  }, [
+    refreshPreviousUserTarget,
+    scheduleHistoryPrependUserHandoffSettle,
+    scheduleQueuedLoadEarlierFlush,
+  ]);
 
   const handleStartReached = useCallback(() => {
     attemptAutoLoadEarlier();
@@ -2479,9 +2637,9 @@ export function MessageRenderer({
         // 二分实锤,3.3.2 / 3.3.3 均复现)。
         alignItemsAtEnd
         maintainScrollAtEnd={false}
-        // Ordinary updates keep LegendList's native data/size anchoring. Manual history prepends
-        // disable the whole prop before the request starts because RN exposes one native switch:
-        // leaving either flag on would race the app-owned key/offset correction on Android.
+        // iOS always uses LegendList/RN's atomic data/size anchoring. Android history prepends
+        // temporarily disable the whole prop because RN exposes one native switch: leaving either
+        // flag on would race the app-owned key/offset correction there.
         maintainVisibleContentPosition={historyPrependNativeMvcpDisabled
           ? false
           : { data: true, size: true }}
@@ -3653,6 +3811,8 @@ function ToolGroupCard({
  * 媒体条 / 结果预览,再点收起。展开态走共享进程内记忆(blockId 前缀 `toolrow-`,
  * 与组级 `tools-` key 空间天然隔离)。无详情可展的行不显示 chevron、不可点击。
  */
+type ToolDetailActions = Pick<MessageActions, 'onLoadToolInput' | 'onOpenPayload'>;
+
 function ToolActionRow({
   actions,
   contentLayout,
@@ -3660,7 +3820,7 @@ function ToolActionRow({
   rowKey,
   tool,
 }: {
-  actions: MessageActions & { firstUserMessageClientId?: string };
+  actions: ToolDetailActions;
   contentLayout: MessageContentLayout;
   row: ToolRowPresentation;
   rowKey?: string;
@@ -3703,11 +3863,75 @@ function ToolActionRow({
           {row.detail || tool.body ? (
             <Text style={styles.toolRowDetailText}>{row.detail ?? tool.body}</Text>
           ) : null}
+          {tool.toolInputProjection ? (
+            <ProjectedToolInputButton
+              key={tool.toolInputProjection.toolUseMessageId}
+              actions={actions}
+              projection={tool.toolInputProjection}
+            />
+          ) : null}
           {tool.diff ? <DiffPreview diff={tool.diff} layout={contentLayout} onOpen={actions.onOpenPayload} /> : null}
           {tool.secondaryBody ? <ToolResultPreview layout={contentLayout} tool={tool} onOpen={actions.onOpenPayload} /> : null}
         </View>
       ) : null}
     </View>
+  );
+}
+
+function ProjectedToolInputButton({
+  actions,
+  projection,
+}: {
+  actions: ToolDetailActions;
+  projection: MobileToolInputProjection;
+}) {
+  const { colors } = useTheme();
+  const { t } = useTranslation();
+  const styles = useThemedStyles(makeStyles);
+  const [status, setStatus] = useState<'error' | 'idle' | 'loading'>('idle');
+  const requestSeqRef = useRef(0);
+
+  useEffect(() => () => {
+    requestSeqRef.current += 1;
+  }, []);
+
+  const openFullInput = useCallback(() => {
+    if (!actions.onLoadToolInput || !actions.onOpenPayload || status === 'loading') return;
+    const requestSeq = requestSeqRef.current + 1;
+    requestSeqRef.current = requestSeq;
+    setStatus('loading');
+    void actions.onLoadToolInput(projection).then((detail) => {
+      if (requestSeqRef.current !== requestSeq) return;
+      setStatus('idle');
+      actions.onOpenPayload?.(buildTextPayload(
+        t('message.renderer.toolInputTitle', { label: detail.toolName }),
+        detail.body,
+      ));
+    }).catch(() => {
+      if (requestSeqRef.current === requestSeq) setStatus('error');
+    });
+  }, [actions, projection, status, t]);
+
+  const label = status === 'loading'
+    ? t('message.renderer.loadingToolInput')
+    : status === 'error'
+      ? t('message.renderer.retryToolInput')
+      : t('message.renderer.viewToolInput');
+  return (
+    <MessageContentOpenButton
+      accessibilityLabel={label}
+      disabled={status === 'loading'}
+      onPress={openFullInput}
+      style={styles.toolInputPreview}
+      testID="message.toolInputPayloadButton"
+    >
+      <View style={styles.toolInputActionRow}>
+        {status === 'loading' ? (
+          <CompactActivityIndicator color={colors.textTertiary} size={iconSize.sm} />
+        ) : null}
+        <Text style={styles.toolInputActionText}>{label}</Text>
+      </View>
+    </MessageContentOpenButton>
   );
 }
 
@@ -4035,10 +4259,16 @@ function WorkGroupCard({
       : null),
     [expanded, isStreaming, item.children],
   );
+  // Tool detail rows do not consume message action/queue/share busy state.
+  // Keep their callbacks and streaming flag stable across those unrelated updates.
+  const toolActions = useMemo(() => ({
+    onLoadToolInput: actions.onLoadToolInput,
+    onOpenPayload: actions.onOpenPayload,
+    isSessionStreaming: actions.isSessionStreaming,
+  }), [actions.onLoadToolInput, actions.onOpenPayload, actions.isSessionStreaming]);
   const startedAtIso = isStreaming && item.startedAtMs !== undefined
     ? new Date(item.startedAtMs).toISOString()
     : undefined;
-  const elapsedMs = useLiveElapsedMs(isStreaming, startedAtIso);
   const explorationSummary = activityProjection?.isPureExploration
     ? [
         activityProjection.explorationCounts.read > 0
@@ -4065,8 +4295,8 @@ function WorkGroupCard({
       onControlledToggle={onToggle}
       title={title}
       subtitle={header.subtitle ?? undefined}
-      trailingMeta={isStreaming && elapsedMs !== null
-        ? <Text style={styles.workGroupElapsed}>{formatDuration(elapsedMs)}</Text>
+      trailingMeta={isStreaming
+        ? <WorkGroupElapsed sinceIso={startedAtIso} />
         : undefined}
       leadingIcon={isStreaming
         ? <CompactActivityIndicator color={colors.textTertiary} size={header.iconSize} />
@@ -4088,7 +4318,7 @@ function WorkGroupCard({
                     {(activityProjection?.toolActivitiesByChildKey.get(child.key) ?? []).map((activity) => (
                       <WorkToolActivityRow
                         key={activity.key}
-                        actions={actions}
+                        actions={toolActions}
                         activity={activity}
                         contentLayout={contentLayout!}
                       />
@@ -4105,12 +4335,21 @@ function WorkGroupCard({
   );
 }
 
-function WorkToolActivityRow({
+/** The clock must not re-render an expanded group's entire activity tree. */
+function WorkGroupElapsed({ sinceIso }: { sinceIso: string | undefined }) {
+  const styles = useThemedStyles(makeStyles);
+  const elapsedMs = useLiveElapsedMs(true, sinceIso);
+  return elapsedMs === null
+    ? null
+    : <Text style={styles.workGroupElapsed}>{formatDuration(elapsedMs)}</Text>;
+}
+
+const WorkToolActivityRow = memo(function WorkToolActivityRow({
   actions,
   activity,
   contentLayout,
 }: {
-  actions: MessageActions & { firstUserMessageClientId?: string };
+  actions: ToolDetailActions & Pick<MessageActions, 'isSessionStreaming'>;
   activity: MobileProjectedToolActivity;
   contentLayout: MessageContentLayout;
 }) {
@@ -4131,9 +4370,13 @@ function WorkToolActivityRow({
       tool={tool}
     />
   );
-}
+}, (previous, next) => (
+  previous.actions === next.actions
+  && previous.contentLayout === next.contentLayout
+  && sameMobileWorkToolActivity(previous.activity, next.activity)
+));
 
-function ExpandedWorkThinkingRow({
+const ExpandedWorkThinkingRow = memo(function ExpandedWorkThinkingRow({
   item,
 }: {
   item: MobileThinkingItem;
@@ -4194,7 +4437,7 @@ function ExpandedWorkThinkingRow({
         : null}
     </Pressable>
   );
-}
+});
 
 // 真·子 agent 嵌套卡片(手机端净新能力):复用 FoldablePanel(与 ToolGroupCard/WorkGroupCard 同款折叠
 // 路径,滚动安全已验证)、默认折叠;展开递归渲染内层 childItems(经 RenderItemView)+ 子 agent 终稿。
@@ -4537,6 +4780,9 @@ function MobileSystemCard({
   type: NonNullable<NormalizedRemoteMessage['systemCardType']>;
 }) {
   const styles = useThemedStyles(makeStyles);
+  if (type === 'compact' || type === 'goal-complete' || type === 'goal-resumed' || type === 'context-rebuild') {
+    return <MobileBoundaryNotice type={type} data={data} />;
+  }
   // agent-switch 走专用「分隔线 + 药丸」渲染(对齐桌面),不落通用盒子卡片。
   if (type === 'agent-switch') return <MobileAgentSwitchCard data={data} />;
   // auto-resume 复用桌面 AgentActionRow 的单行状态布局:默认只显示当前状态和压缩后的
@@ -4803,9 +5049,9 @@ function MarkdownBody({
     setContentWidth((current) => nextSettledContentWidth(current, nextWidth));
   }, [pinContentWidth]);
   const pinSettledWidth = pinContentWidth && contentWidth > 0;
-  const settledTextStyle = pinSettledWidth
+  const settledTextStyle = useMemo(() => pinSettledWidth
     ? [styles.messageText, { width: contentWidth }]
-    : styles.messageText;
+    : styles.messageText, [contentWidth, pinSettledWidth, styles.messageText]);
   const markdownParseRef = useRef<MobileMarkdownParseResult | null>(null);
   const markdownParse = useMemo(() => {
     const startedAt = typeof performance !== 'undefined' && typeof performance.now === 'function'
@@ -4854,19 +5100,10 @@ function MarkdownBody({
     markdownImageCacheKey,
     onOpenPayload,
   ]);
-  // 会话深链 chip 标题:渲染期同步从会话镜像查(WebView 静态 HTML 无法事后
-  // patch)。不含深链的消息恒为 undefined,不影响 html memo 稳定性。
-  const sessionLinkIds = useMemo(() => extractSessionLinkIds(text), [text]);
+  // Preserve the inline renderer while streaming or unrelated task metadata
+  // changes; referenced task title changes still refresh every affected chip.
   const remoteSessions = useRemoteSessions();
-  const sessionLinkTitles = useMemo(() => {
-    if (sessionLinkIds.length === 0) return undefined;
-    const map: Record<string, string> = {};
-    for (const id of sessionLinkIds) {
-      const title = remoteSessions.find((s) => s.id === id)?.title?.trim();
-      if (title) map[id] = title;
-    }
-    return Object.keys(map).length > 0 ? map : undefined;
-  }, [sessionLinkIds, remoteSessions]);
+  const sessionLinkTitles = useMarkdownSessionLinkTitles(text, remoteSessions);
   const sessionReferenceDetails = useMemo(() => {
     if (!sessionReferences?.length) return undefined;
     const details: Record<string, string> = {};
@@ -4894,7 +5131,9 @@ function MarkdownBody({
         streaming,
       }))
     ),
-    [onOpenSessionLink, openMarkdownImage, sessionLinkTitles, sessionReferenceDetails, streaming, styles],
+    // renderInline also reads translated fallback labels. Invalidate completed
+    // memoized text blocks when useTranslation refreshes its bound translator.
+    [onOpenSessionLink, openMarkdownImage, sessionLinkTitles, sessionReferenceDetails, streaming, styles, t],
   );
   const textRunGroupingOptions = Platform.OS === 'android'
     ? ANDROID_SELECTABLE_TEXT_RUN_GROUPING_OPTIONS
@@ -4918,9 +5157,34 @@ function MarkdownBody({
   // 一个高度恰为 gap 的空行在视觉上与原块间距一致。由单块切出的 continuation 不插间距。
   // 列表项在树内表达为「marker 前缀 span + 正文」
   // (无悬挂缩进;任务项以 ☑/☐ 字符替代原边框小方块)。
-  const renderTextRun = (group: Extract<MobileMarkdownBlockGroup, { type: 'text_run' }>): ReactNode => {
+  const renderTextRunBlock = useCallback((block: MobileMarkdownBlock, leadingGap: boolean): ReactNode => {
+    if (block.type !== 'paragraph' && block.type !== 'heading' && block.type !== 'list_item') return null;
     const runSelectable = selectable === true;
     const RunSpan = spanFor(runSelectable) ?? Text;
+    const spans: ReactNode[] = [];
+    if (leadingGap) {
+      spans.push(
+        <RunSpan key={`${block.key}:gap`} style={{ lineHeight: layout.markdownBodyGap }}>
+          {'\n\n'}
+        </RunSpan>,
+      );
+    }
+    const baseStyle: StyleProp<TextStyle> = block.type === 'heading'
+      ? [styles.markdownHeading, headingSizeStyle(styles, block.level)]
+      : styles.messageText;
+    if (block.type === 'list_item' && !('textRunContinuation' in block && block.textRunContinuation)) {
+      const task = typeof block.checked === 'boolean';
+      spans.push(
+        <RunSpan key={`${block.key}:marker`} style={[styles.messageText, styles.markdownListMarkerInline]}>
+          {task ? (block.checked ? '☑ ' : '☐ ') : block.ordered ? `${block.marker} ` : '• '}
+        </RunSpan>,
+      );
+    }
+    spans.push(...renderInlines(block.inlines, spanFor(runSelectable), baseStyle, block.key));
+    return spans;
+  }, [layout.markdownBodyGap, renderInlines, selectable, spanFor, styles]);
+  const renderTextRun = (group: Extract<MobileMarkdownBlockGroup, { type: 'text_run' }>): ReactNode => {
+    const runSelectable = selectable === true;
     return (
       <MarkdownSelectableText
         allowIosUITextView={allowIosUITextView}
@@ -4929,35 +5193,196 @@ function MarkdownBody({
         style={settledTextStyle}
         testID="message.markdownTextRun"
       >
-        {group.blocks.flatMap((block, index) => {
-          const spans: ReactNode[] = [];
-          if (index > 0 && !block.textRunContinuation) {
-            spans.push(
-              <RunSpan key={`${block.key}:gap`} style={{ lineHeight: layout.markdownBodyGap }}>
-                {'\n\n'}
-              </RunSpan>,
-            );
-          }
-          const baseStyle: StyleProp<TextStyle> = block.type === 'heading'
-            ? [styles.markdownHeading, headingSizeStyle(styles, block.level)]
-            : styles.messageText;
-          if (block.type === 'list_item' && !block.textRunContinuation) {
-            const task = typeof block.checked === 'boolean';
-            spans.push(
-              <RunSpan
-                key={`${block.key}:marker`}
-                style={[styles.messageText, styles.markdownListMarkerInline]}
-              >
-                {task ? (block.checked ? '☑ ' : '☐ ') : block.ordered ? `${block.marker} ` : '• '}
-              </RunSpan>,
-            );
-          }
-          spans.push(...renderInlines(block.inlines, spanFor(runSelectable), baseStyle, block.key));
-          return spans;
-        })}
+        {group.blocks.map((block, index) => (
+          <MarkdownBlockContent
+            key={block.key}
+            block={block}
+            leadingGap={index > 0 && !block.textRunContinuation}
+            renderBlock={renderTextRunBlock}
+          />
+        ))}
       </MarkdownSelectableText>
     );
   };
+  const renderSingleBlock = useCallback((block: MobileMarkdownBlock): ReactNode => {
+    if (block.type === 'mermaid') {
+      // 内联图表按「图片」形态呈现:无卡片 chrome、无标签文字、无按钮,
+      // 就是一块圆角图表;点击任意位置打开沉浸式全屏详情(透明 Pressable
+      // 盖住整块——WebView 会吞掉触摸事件,不盖层拿不到点击)。
+      return (
+        <View key={block.key} testID="message.mermaidPreviewButton">
+          <ViewabilityGatedMermaidDiagram source={block.text} testID="message.mermaidDiagram" />
+          {onOpenPayload ? (
+            <Pressable
+              accessibilityLabel={t('message.renderer.openDiagramDetail')}
+              accessibilityRole="button"
+              onPress={() => onOpenPayload(buildMermaidPayload(block.text))}
+              style={StyleSheet.absoluteFill}
+              testID="message.mermaidPreviewTap"
+            />
+          ) : null}
+        </View>
+      );
+    }
+    if (block.type === 'math') {
+      // display 公式:WebView + KaTeX(形态对齐 mermaid 块,无 chip 卡壳——
+      // 公式在视觉上是正文的一部分,背景与气泡底色一致)。
+      return (
+        <ViewabilityGatedMathFormula
+          key={block.key}
+          source={block.text}
+          testID="message.mathFormula"
+        />
+      );
+    }
+    if (block.type === 'code') {
+      // 围栏代码在气泡内换行,不用横向 ScrollView:后者在展开长用户消息时
+      // 会按未折行内容报出超高,气泡巨幅空白并把每行裁在右侧圆角外。
+      return (
+        <View key={block.key} style={styles.markdownCodeFrame}>
+          <View
+            style={[
+              styles.markdownCodeContent,
+              {
+                paddingHorizontal: layout.codePaddingHorizontal,
+                paddingVertical: layout.codePaddingVertical,
+              },
+            ]}
+          >
+            <HighlightedCodeText
+              SpanComponent={spanFor(selectable === true) ?? Text}
+              allowIosUITextView={allowIosUITextView}
+              language={block.language}
+              selectable={selectable === true}
+              styles={styles}
+              text={block.text}
+            />
+          </View>
+        </View>
+      );
+    }
+    if (block.type === 'heading') {
+      const headingStyle = [
+        styles.markdownHeading,
+        headingSizeStyle(styles, block.level),
+      ];
+      const headingSelectable = inlinesSelectable(block.inlines);
+      return (
+        <MarkdownSelectableText
+          allowIosUITextView={allowIosUITextView}
+          key={block.key}
+          selectable={headingSelectable}
+          style={headingStyle}
+          testID="message.markdownHeading"
+        >
+          {renderInlines(block.inlines, spanFor(headingSelectable))}
+        </MarkdownSelectableText>
+      );
+    }
+    if (block.type === 'blockquote') {
+      return (
+        <View key={block.key} style={styles.markdownQuote} testID="message.markdownQuote">
+          <MarkdownSelectableText
+            allowIosUITextView={allowIosUITextView}
+            selectable={inlinesSelectable(block.inlines)}
+            style={[styles.messageText, styles.markdownQuoteText]}
+          >
+            {renderInlines(block.inlines, spanFor(inlinesSelectable(block.inlines)))}
+          </MarkdownSelectableText>
+        </View>
+      );
+    }
+    if (block.type === 'list_item') {
+      const task = typeof block.checked === 'boolean';
+      return (
+        <View
+          key={block.key}
+          style={[styles.markdownListRow, { gap: layout.markdownListGap }]}
+          testID={task ? 'message.markdownTaskItem' : undefined}
+        >
+          <Text style={[
+            styles.markdownListMarker,
+            { width: layout.markdownListMarkerWidth },
+            task && styles.markdownTaskMarker,
+          ]}>
+            {task ? (block.checked ? '✓' : '') : block.ordered ? block.marker : '•'}
+          </Text>
+          <MarkdownSelectableText
+            allowIosUITextView={allowIosUITextView}
+            selectable={inlinesSelectable(block.inlines)}
+            style={[styles.messageText, styles.markdownListText]}
+          >
+            {renderInlines(block.inlines, spanFor(inlinesSelectable(block.inlines)))}
+          </MarkdownSelectableText>
+        </View>
+      );
+    }
+    if (block.type === 'table') {
+      const columnWidths = buildMobileMarkdownTableColumnWidths({
+        header: block.header,
+        rows: block.rows,
+        availableWidth: layout.markdownTableAvailableWidth,
+        minWidth: layout.markdownTableCellMinWidth,
+      });
+      return (
+        <ScrollView
+          horizontal
+          key={block.key}
+          style={styles.markdownTableScroll}
+          testID="message.markdownTable"
+        >
+          <View style={styles.markdownTable}>
+            <View style={[styles.markdownTableRow, styles.markdownTableHeaderRow]}>
+              {columnWidths.map((columnWidth, index) => {
+                const cell = block.header[index] ?? [];
+                return (
+                  <MarkdownSelectableText
+                    allowIosUITextView={allowIosUITextView}
+                    key={`${block.key}:th:${index}`}
+                    selectable={inlinesSelectable(cell)}
+                    style={[
+                      styles.markdownTableCell,
+                      { width: columnWidth },
+                      styles.markdownTableHeaderCell,
+                    ]}
+                  >
+                    {renderInlines(cell, spanFor(inlinesSelectable(cell)))}
+                  </MarkdownSelectableText>
+                );
+              })}
+            </View>
+            {block.rows.map((row) => (
+              <View key={row.key} style={styles.markdownTableRow}>
+                {columnWidths.map((columnWidth, index) => {
+                  const cell = row.cells[index] ?? [];
+                  return (
+                    <MarkdownSelectableText
+                      allowIosUITextView={allowIosUITextView}
+                      key={`${row.key}:td:${index}`}
+                      selectable={inlinesSelectable(cell)}
+                      style={[styles.markdownTableCell, { width: columnWidth }]}
+                    >
+                      {renderInlines(cell, spanFor(inlinesSelectable(cell)))}
+                    </MarkdownSelectableText>
+                  );
+                })}
+              </View>
+            ))}
+          </View>
+        </ScrollView>
+      );
+    }
+    return (
+      <MarkdownSelectableText
+        allowIosUITextView={allowIosUITextView}
+        key={`${block.key}:${pinSettledWidth ? contentWidth : 'hug'}`}
+        selectable={inlinesSelectable(block.inlines)}
+        style={settledTextStyle}
+      >
+        {renderInlines(block.inlines, spanFor(inlinesSelectable(block.inlines)))}
+      </MarkdownSelectableText>
+    );
+  }, [allowIosUITextView, contentWidth, inlinesSelectable, layout, onOpenPayload, pinSettledWidth, renderInlines, selectable, settledTextStyle, spanFor, styles, t]);
   return (
     <View
       collapsable={false}
@@ -4974,189 +5399,9 @@ function MarkdownBody({
         style={pinSettledWidth ? { width: contentWidth, maxWidth: '100%' } : null}
       >
       {groups.flatMap((group, groupIndex) => {
-        const renderedGroup = (() => {
-          if (group.type === 'text_run') {
-            return renderTextRun(group);
-          }
-          const block = group.block;
-          if (block.type === 'mermaid') {
-          // 内联图表按「图片」形态呈现:无卡片 chrome、无标签文字、无按钮,
-          // 就是一块圆角图表;点击任意位置打开沉浸式全屏详情(透明 Pressable
-          // 盖住整块——WebView 会吞掉触摸事件,不盖层拿不到点击)。
-          return (
-            <View key={block.key} testID="message.mermaidPreviewButton">
-              <ViewabilityGatedMermaidDiagram source={block.text} testID="message.mermaidDiagram" />
-              {onOpenPayload ? (
-                <Pressable
-                  accessibilityLabel={t('message.renderer.openDiagramDetail')}
-                  accessibilityRole="button"
-                  onPress={() => onOpenPayload(buildMermaidPayload(block.text))}
-                  style={StyleSheet.absoluteFill}
-                  testID="message.mermaidPreviewTap"
-                />
-              ) : null}
-            </View>
-          );
-        }
-        if (block.type === 'math') {
-          // display 公式:WebView + KaTeX(形态对齐 mermaid 块,无 chip 卡壳——
-          // 公式在视觉上是正文的一部分,背景与气泡底色一致)。
-          return (
-            <ViewabilityGatedMathFormula
-              key={block.key}
-              source={block.text}
-              testID="message.mathFormula"
-            />
-          );
-        }
-        if (block.type === 'code') {
-          // 围栏代码在气泡内换行,不用横向 ScrollView:后者在展开长用户消息时
-          // 会按未折行内容报出超高,气泡巨幅空白并把每行裁在右侧圆角外。
-          return (
-            <View key={block.key} style={styles.markdownCodeFrame}>
-              <View
-                style={[
-                  styles.markdownCodeContent,
-                  {
-                    paddingHorizontal: layout.codePaddingHorizontal,
-                    paddingVertical: layout.codePaddingVertical,
-                  },
-                ]}
-              >
-                <HighlightedCodeText
-                  SpanComponent={spanFor(selectable === true) ?? Text}
-                  allowIosUITextView={allowIosUITextView}
-                  language={block.language}
-                  selectable={selectable === true}
-                  styles={styles}
-                  text={block.text}
-                />
-              </View>
-            </View>
-          );
-        }
-        if (block.type === 'heading') {
-          const headingStyle = [
-            styles.markdownHeading,
-            headingSizeStyle(styles, block.level),
-          ];
-          const headingSelectable = inlinesSelectable(block.inlines);
-          return (
-            <MarkdownSelectableText
-              allowIosUITextView={allowIosUITextView}
-              key={block.key}
-              selectable={headingSelectable}
-              style={headingStyle}
-              testID="message.markdownHeading"
-            >
-              {renderInlines(block.inlines, spanFor(headingSelectable))}
-            </MarkdownSelectableText>
-          );
-        }
-        if (block.type === 'blockquote') {
-          return (
-            <View key={block.key} style={styles.markdownQuote} testID="message.markdownQuote">
-              <MarkdownSelectableText
-                allowIosUITextView={allowIosUITextView}
-                selectable={inlinesSelectable(block.inlines)}
-                style={[styles.messageText, styles.markdownQuoteText]}
-              >
-                {renderInlines(block.inlines, spanFor(inlinesSelectable(block.inlines)))}
-              </MarkdownSelectableText>
-            </View>
-          );
-        }
-        if (block.type === 'list_item') {
-          const task = typeof block.checked === 'boolean';
-          return (
-            <View
-              key={block.key}
-              style={[styles.markdownListRow, { gap: layout.markdownListGap }]}
-              testID={task ? 'message.markdownTaskItem' : undefined}
-            >
-              <Text style={[
-                styles.markdownListMarker,
-                { width: layout.markdownListMarkerWidth },
-                task && styles.markdownTaskMarker,
-              ]}>
-                {task ? (block.checked ? '✓' : '') : block.ordered ? block.marker : '•'}
-              </Text>
-              <MarkdownSelectableText
-                allowIosUITextView={allowIosUITextView}
-                selectable={inlinesSelectable(block.inlines)}
-                style={[styles.messageText, styles.markdownListText]}
-              >
-                {renderInlines(block.inlines, spanFor(inlinesSelectable(block.inlines)))}
-              </MarkdownSelectableText>
-            </View>
-          );
-        }
-        if (block.type === 'table') {
-          const columnWidths = buildMobileMarkdownTableColumnWidths({
-            header: block.header,
-            rows: block.rows,
-            availableWidth: layout.markdownTableAvailableWidth,
-            minWidth: layout.markdownTableCellMinWidth,
-          });
-          return (
-            <ScrollView
-              horizontal
-              key={block.key}
-              style={styles.markdownTableScroll}
-              testID="message.markdownTable"
-            >
-              <View style={styles.markdownTable}>
-                <View style={[styles.markdownTableRow, styles.markdownTableHeaderRow]}>
-                  {columnWidths.map((columnWidth, index) => {
-                    const cell = block.header[index] ?? [];
-                    return (
-                      <MarkdownSelectableText
-                        allowIosUITextView={allowIosUITextView}
-                        key={`${block.key}:th:${index}`}
-                        selectable={inlinesSelectable(cell)}
-                        style={[
-                          styles.markdownTableCell,
-                          { width: columnWidth },
-                          styles.markdownTableHeaderCell,
-                        ]}
-                      >
-                        {renderInlines(cell, spanFor(inlinesSelectable(cell)))}
-                      </MarkdownSelectableText>
-                    );
-                  })}
-                </View>
-                {block.rows.map((row) => (
-                  <View key={row.key} style={styles.markdownTableRow}>
-                    {columnWidths.map((columnWidth, index) => {
-                      const cell = row.cells[index] ?? [];
-                      return (
-                        <MarkdownSelectableText
-                          allowIosUITextView={allowIosUITextView}
-                          key={`${row.key}:td:${index}`}
-                          selectable={inlinesSelectable(cell)}
-                          style={[styles.markdownTableCell, { width: columnWidth }]}
-                        >
-                          {renderInlines(cell, spanFor(inlinesSelectable(cell)))}
-                        </MarkdownSelectableText>
-                      );
-                    })}
-                  </View>
-                ))}
-              </View>
-            </ScrollView>
-          );
-        }
-        return (
-          <MarkdownSelectableText
-            allowIosUITextView={allowIosUITextView}
-            key={`${block.key}:${pinSettledWidth ? contentWidth : 'hug'}`}
-            selectable={inlinesSelectable(block.inlines)}
-            style={settledTextStyle}
-          >
-            {renderInlines(block.inlines, spanFor(inlinesSelectable(block.inlines)))}
-          </MarkdownSelectableText>
-        );
-        })();
+        const renderedGroup = group.type === 'text_run'
+          ? renderTextRun(group)
+          : <MarkdownBlockContent key={group.key} block={group.block} renderBlock={renderSingleBlock} />;
         if (groupIndex === 0 || isTextRunContinuationGroup(group)) {
           return [renderedGroup];
         }
@@ -8330,6 +8575,25 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
   toolRowDetailText: {
     color: colors.textSecondary,
     fontSize: typeScale.footnote,
+    lineHeight: lineHeight.caption,
+  },
+  toolInputPreview: {
+    backgroundColor: colors.chatCodeSurface,
+    borderColor: colors.chatCodeBorder,
+    borderRadius: radius.container,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  toolInputActionRow: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: spacing.sm,
+    minHeight: MESSAGE_CONTROL_TOUCH_SIZE,
+    paddingHorizontal: spacing.sm,
+  },
+  toolInputActionText: {
+    color: colors.textTertiary,
+    fontSize: typeScale.caption,
+    fontWeight: fontWeight.medium,
     lineHeight: lineHeight.caption,
   },
   toolName: {

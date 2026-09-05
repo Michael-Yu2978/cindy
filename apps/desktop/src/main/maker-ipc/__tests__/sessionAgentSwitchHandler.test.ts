@@ -19,6 +19,7 @@ function makeRow(overrides: Partial<AgentSwitchSessionRow> = {}): AgentSwitchSes
     id: 's1',
     agentKind: 'cc',
     model: 'claude-fable-5',
+    providerId: 'xd',
     status: 'active',
     remoteHostId: null,
     orcaRole: null,
@@ -76,6 +77,55 @@ const validParams = {
 };
 
 describe('performSessionAgentSwitch', () => {
+  it('cycles Claude → Codex → Pi → Claude → Codex and recovers a broken parked thread once', async () => {
+    let row = makeRow();
+    const parked = new Map<string, string>();
+    const boundaries: Array<{ fromAgentKind: string; fromSdkSessionId: string | null; handoff: string }> = [];
+    let bootstraps = 0;
+    const { deps } = makeDeps({
+      getSessionRow: async () => ({ ...row }),
+      findParkedEngineSession: async (_sessionId, kind) => {
+        const sdkSessionId = parked.get(kind);
+        return sdkSessionId ? { sdkSessionId, watermarkCreatedAt: 0, watermarkRowid: 0 } : null;
+      },
+      applyAgentSwitchToDb: async (_sessionId, patch) => {
+        row = { ...row, ...patch, providerId: patch.providerId ?? null, sdkSessionId: patch.sdkSessionId ?? null };
+      },
+      insertBoundaryMessage: async (_sessionId, boundary) => {
+        if (boundary.fromSdkSessionId) parked.set(boundary.fromAgentKind, boundary.fromSdkSessionId);
+        boundaries.push(boundary);
+        return `boundary-${boundaries.length}`;
+      },
+      bootstrapSwitchedSession: async () => {
+        bootstraps++;
+        if (row.sdkSessionId === 'broken-codex') throw new Error('thread history projection expected ordinal 15, got 3');
+        row.sdkSessionId ??= `native-${row.agentKind}-${bootstraps}`;
+      },
+      applyResumeFallbackAtomically: async (_sessionId, boundaryId, boundary) => {
+        row.sdkSessionId = null;
+        boundaries[Number(boundaryId.split('-')[1]) - 1] = boundary;
+      },
+    });
+    const choices = [
+      { targetAgentKind: 'codex', model: 'gpt-6-astra', providerId: 'openai', effort: 'high', fastMode: true },
+      { targetAgentKind: 'pi', model: 'grok-4.6', providerId: 'xai', effort: 'high', fastMode: false },
+      { targetAgentKind: 'claude-code', model: 'claude-fable-5', providerId: 'xd', effort: 'medium', fastMode: false },
+      { targetAgentKind: 'codex', model: 'codex/gpt-5.6-sol', providerId: 'xd', effort: 'high', fastMode: false },
+    ];
+    for (const [index, choice] of choices.entries()) {
+      if (index === 3) parked.set('codex', 'broken-codex');
+      const result = await performSessionAgentSwitch(deps, { sessionId: 's1', ...choice, applyNow: true });
+      expect(result).toMatchObject({ switched: true, engineReady: true });
+      expect(row.model).toBe(choice.model);
+      expect(row.providerId).toBe(choice.providerId);
+      expect(boundaries.at(-1)?.handoff).toContain('你好');
+    }
+    expect(bootstraps).toBe(5);
+    expect(boundaries).toHaveLength(4);
+    expect(row.sdkSessionId).toBe('native-codex-5');
+    expect(boundaries.at(-1)).toMatchObject({ resumed: false });
+  });
+
   it('happy path:close → DB 提交 → 边界行 → pending → bootstrap,顺序正确', async () => {
     const { deps, calls } = makeDeps();
     const result = await performSessionAgentSwitch(deps, validParams);
@@ -93,6 +143,8 @@ describe('performSessionAgentSwitch', () => {
     expect(boundary.toAgentKind).toBe('codex');
     expect(boundary.fromModel).toBe('claude-fable-5');
     expect(boundary.toModel).toBe('gpt-5.5');
+    expect(boundary.fromProviderId).toBe('xd');
+    expect(boundary.toProviderId).toBeNull();
     expect(boundary.fromSdkSessionId).toBe('sdk-old');
     expect(boundary.resumed).toBe(false);
     expect(boundary.consumed).toBe(false);
@@ -115,6 +167,8 @@ describe('performSessionAgentSwitch', () => {
     const boundary = vi.mocked(deps.insertBoundaryMessage).mock.calls[0][1];
     expect(boundary.fromAgentKind).toBe('codex');
     expect(boundary.toAgentKind).toBe('cc');
+    expect(boundary.fromProviderId).toBe('xd');
+    expect(boundary.toProviderId).toBe('xd');
   });
 
   it('codex → pi + OpenAI 关闭旧会话并保持目标 provider route', async () => {

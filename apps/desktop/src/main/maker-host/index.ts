@@ -21,6 +21,7 @@ import {
 import type { ProviderView } from '@cindy/model-providers';
 import {
   getActiveCatalog,
+  getActiveCatalogRevision,
   getLocalCatalogOverridesSnapshot,
   setActiveCatalogChangedListener,
   setDiscoveredCodexModels,
@@ -109,7 +110,12 @@ import {
   resolvePiRuntimeModelDescriptor,
   resolvePiGatewayDescriptorProviderId,
   resolveVerifiedContextWindow,
+  resolveExplicitCustomContextWindow,
 } from './catalog-to-descriptors.js';
+import {
+  bundledCodexCatalogHasModel,
+  prepareCodexCustomContextCatalog,
+} from './codex-custom-context-catalog.js';
 import { buildPiAgent } from './pi-host.js';
 import {
   captureLocalPiPackageRuntimeInvalidationSnapshot,
@@ -152,17 +158,23 @@ import {
   armCodexHttpRecovery,
   clearCodexProxyAuthInjection,
   ensureCodexControlPlaneProxyReady,
+  ensureCodexCustomContextProxyReady,
   ensureCodexProxyReady,
   getCodexControlPlaneProxyEndpoint,
+  getCodexCustomContextProxyEndpoint,
   getCodexProxyAuthInjectionState,
   getCodexProxyEndpoint,
+  getObservedCodexSubagentIdentity,
   getCodexThreadUpstreamOrigin,
   isCodexControlPlaneProxyHandleReady,
+  isCodexCustomContextProxyHandleReady,
   isCodexProxyHandleReady,
+  releaseCodexCustomContextProxy,
   setCodexProxyAuthInjection,
   setCodexProxyGatewayKeyReader,
   registerComposed as registerCodexProxyComposed,
   registerChildThread as registerCodexProxyChildThread,
+  setCodexAppliedCustomProviderRoutes,
   unregister as unregisterCodexProxyPrompt,
 } from './codex-proxy-host.js';
 import { createDesktopMcpProviders } from '../mcp-integrations/mcp-providers.js';
@@ -229,15 +241,20 @@ import {
   CODEX_OPENAI_COMPACT_PROVIDER_ID,
 } from './codex-gateway-config.js';
 import {
+  buildCodexCustomProviderArgs,
+  deriveCodexCustomProviderRoutes,
+  toCodexCustomProviderHostRoutes,
+} from './codex-custom-provider-route.js';
+import {
   buildCodexSubagentSpawnArgs,
-  codexSubagentRouteUsesChatGptOAuth,
-  codexSubagentRouteResolutionFailed,
   resolveCodexSubagentRoutingProfile,
-  resolveEffectiveCodexSubagentSettings,
-  resolveCodexSubagentModelFallback,
-  resolveCodexSubagentHostCredentialPlan,
-  resolveCodexSubagentRouteSnapshot,
+  type CodexSmartSubagentConfig,
 } from './codex-subagent-config.js';
+import {
+  codexSmartSubagentRoutingSignature,
+  prepareCodexSmartSubagentConfig,
+  selectCodexSmartSubagentCandidates,
+} from './codex-smart-subagent-routing.js';
 import { readSubagentModelSettings } from './subagent-model-settings-store.js';
 import {
   registerAgentProcess,
@@ -1221,6 +1238,24 @@ export function getMaker(): Maker {
       orcaWorkerBridgeProvider,
     ];
     _codexMcpProviders = codexMcpProviders;
+    const resolveDesiredCodexSubagentRoutingSignature = async (ctx: {
+      credentialMode?: 'oauth-bearer' | 'gateway-key' | 'provider-oauth';
+      hostPurpose?: 'control-plane' | 'review' | 'custom-context';
+    }): Promise<string> => {
+      const settings = readSubagentModelSettings();
+      if (
+        ctx.hostPurpose === 'control-plane'
+        || ctx.hostPurpose === 'review'
+        || !settings.codexSmartSubagentRouting
+      ) return 'default';
+      const providerViews: ProviderView[] =
+        await getDesktopProviderService().listProviders({ allowSideEffects: false });
+      const candidates = selectCodexSmartSubagentCandidates(providerViews, {
+        allowChatGptOAuth: ctx.credentialMode === 'oauth-bearer',
+      });
+      return codexSmartSubagentRoutingSignature(candidates, getActiveCatalogRevision())
+        ?? 'default';
+    };
     const codexAgent = new CodexAgent({
       auth: desktopCodexAuthAdapter,
       runtimeConfig: desktopCodexRuntimeConfig,
@@ -1293,6 +1328,27 @@ export function getMaker(): Maker {
       // 让 agent 按 id 回查 availableModels —— 那张表去重后 provider 归属已丢。
       resolveVerifiedContextWindow: (providerId, modelId) =>
         resolveVerifiedContextWindow(getDesktopSelectableCatalog(), 'codex', providerId, modelId),
+      resolveCodexThreadContextWindow: async (providerId, modelId) => {
+        const contextWindow = resolveExplicitCustomContextWindow(
+          getDesktopSelectableCatalog(),
+          'codex',
+          providerId,
+          modelId,
+        );
+        if (contextWindow === null) return null;
+        try {
+          if (await bundledCodexCatalogHasModel(codexPath, modelId)) return contextWindow;
+          desktopMakerLogger.debug(
+            'Codex custom context override skipped: bundled catalog has no matching model',
+          );
+        } catch (error) {
+          desktopMakerLogger.warn(
+            'Codex custom context catalog preflight failed; using fallback model metadata',
+            { error: error instanceof Error ? error.message : String(error) },
+          );
+        }
+        return null;
+      },
       onCodexLocalModelsListed: (models) => {
         setDiscoveredCodexModels(mapCodexAppServerModelsToCatalog(models));
       },
@@ -1325,6 +1381,8 @@ export function getMaker(): Maker {
           toMode: ctx.toMode,
         });
       },
+      resolveCodexSubagentRoutingSignature: async (_providers, ctx) =>
+        resolveDesiredCodexSubagentRoutingSignature(ctx),
       prepareCodexExtraSpawnConfig: async (providers, ctx) => {
         if (ctx.remoteHostId) {
           // The remote daemon owns its own CODEX_HOME and Chrome companion.
@@ -1339,7 +1397,16 @@ export function getMaker(): Maker {
         }
         const isControlPlane = ctx.hostPurpose === 'control-plane';
         const isReview = ctx.hostPurpose === 'review';
-        const usesIsolatedProxy = isControlPlane || isReview;
+        const isCustomContext = ctx.hostPurpose === 'custom-context';
+        const customContextHostKey = isCustomContext
+          ? ctx.customContextHostKey?.trim() ?? ''
+          : '';
+        if (isCustomContext && !customContextHostKey) {
+          const error = new Error('custom-context Codex host is missing its runtime scope key');
+          (error as { codexSpawnConfigFatal?: boolean }).codexSpawnConfigFatal = true;
+          throw error;
+        }
+        const usesIsolatedProxy = isControlPlane || isReview || isCustomContext;
         let mcpExtraArgs: string[] = [];
         let mcpExtraEnv: Record<string, string> = {};
         let buildSessionMcpConfig:
@@ -1369,7 +1436,7 @@ export function getMaker(): Maker {
             codexAppliedContactsEnabled = false;
           }
         }
-        const browserCompanion = usesIsolatedProxy
+        const browserCompanion = isControlPlane || isReview
           ? null
           : await prepareCodexBrowserCompanion({ codexHome: getCodexHome() });
         const browserCompanionSpawnConfig =
@@ -1409,17 +1476,28 @@ export function getMaker(): Maker {
           await broadcastCodexRuntimeRoute();
         }
         setCodexProxyGatewayKeyReader(readClaudeApiKey);
+        const customContextProviderRoutes = isCustomContext
+          ? deriveCodexCustomProviderRoutes(getActiveCatalog())
+          : [];
 
         // 这个点在 CodexAgent.createHost() 内。返回的 codexProxyActive 会被冻到 AppServerHost 实例上,
         // 后续 startSession 只读 host 自己的事实,不再 live 读全局 flag。
-        if (usesIsolatedProxy) {
+        if (isCustomContext) {
+          await ensureCodexCustomContextProxyReady(
+            customContextHostKey,
+            authInjection,
+            customContextProviderRoutes,
+          );
+        } else if (usesIsolatedProxy) {
           await ensureCodexControlPlaneProxyReady(authInjection);
         } else {
           await ensureCodexProxyReady();
         }
-        const ready = usesIsolatedProxy
-          ? isCodexControlPlaneProxyHandleReady(authInjection)
-          : isCodexProxyHandleReady();
+        const ready = isCustomContext
+          ? isCodexCustomContextProxyHandleReady(customContextHostKey)
+          : usesIsolatedProxy
+            ? isCodexControlPlaneProxyHandleReady(authInjection)
+            : isCodexProxyHandleReady();
         if ((useOAuthBearer || authInjection === 'provider-oauth') && !ready) {
           const error = new Error(
             authInjection === 'provider-oauth'
@@ -1428,133 +1506,124 @@ export function getMaker(): Maker {
           );
           // fallback OAuth 也是凭据隔离要求,不能被 maker-core 当成普通 MCP 降级吞掉。
           (error as { codexSpawnConfigFatal?: boolean }).codexSpawnConfigFatal = true;
+          if (isCustomContext) {
+            await releaseCodexCustomContextProxy(customContextHostKey);
+          }
           throw error;
         }
         // gateway-key 模式下 proxy 挂了仍可 fallback 到 gateway base_url(codex 直连 gateway, 不裸奔)。
-        const endpoint = usesIsolatedProxy
-          ? getCodexControlPlaneProxyEndpoint(authInjection)
-          : getCodexProxyEndpoint();
-        const storedSubagentModelSettings = readSubagentModelSettings();
-        const mainTaskCredentialMode = ctx.requestedCredentialMode ?? credentialMode;
-        let subagentProviderViews: ProviderView[] | undefined;
-        if (
-          !isReview
-          && !ctx.remoteHostId
-          && storedSubagentModelSettings.codexSubagentsEnabled
-          && storedSubagentModelSettings.codex?.trim()
-        ) {
-          // OAuth 主任务也需要识别固定路由的来源，区分“ChatGPT 路由在两侧都回落默认”
-          // 与“其它路由只在 OAuth 侧临时回落”；读取失败时保留空数组，令显式 OpenAI
-          // 选择仍可按稳定来源 id 识别，其它路由继续 fail-closed。
-          subagentProviderViews = [];
-          try {
-            subagentProviderViews = await getDesktopProviderService().listProviders({
-              allowSideEffects: false,
-            });
-          } catch (err) {
-            desktopMakerLogger.warn('Codex implicit subagent Provider resolution failed', {
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
+        const endpoint = isCustomContext
+          ? getCodexCustomContextProxyEndpoint(customContextHostKey)
+          : usesIsolatedProxy
+            ? getCodexControlPlaneProxyEndpoint(authInjection)
+            : getCodexProxyEndpoint();
+        const codexCustomProviderRoutes =
+          isCustomContext && ready
+            ? customContextProviderRoutes
+            : !usesIsolatedProxy && ready
+              ? deriveCodexCustomProviderRoutes(getActiveCatalog())
+              : [];
+        if (!usesIsolatedProxy) {
+          // The proxy must follow the exact capability/routing snapshot frozen into
+          // this task Host, not the catalog that may already be ahead during a busy restart.
+          setCodexAppliedCustomProviderRoutes(codexCustomProviderRoutes);
         }
-        const configuredSubagentRoute = !isReview
-          ? resolveCodexSubagentRouteSnapshot(
-              storedSubagentModelSettings,
-              ctx.remoteHostId,
-              subagentProviderViews,
-            )
-          : undefined;
-        const subagentModelSettings = resolveEffectiveCodexSubagentSettings(
-          storedSubagentModelSettings,
-          mainTaskCredentialMode,
-          configuredSubagentRoute,
-          subagentProviderViews,
+        const codexCustomProviderSpawn = buildCodexCustomProviderArgs(
+          endpoint,
+          authInjection,
+          codexCustomProviderRoutes,
         );
-        const codexSubagentRoutingProfile = !isReview && !ctx.remoteHostId
-          ? resolveCodexSubagentRoutingProfile(
-              storedSubagentModelSettings,
-              mainTaskCredentialMode,
-              configuredSubagentRoute,
-              subagentProviderViews,
-            )
-          : 'default';
-        const subagentModelFallback = !isReview
-          ? resolveCodexSubagentModelFallback(subagentModelSettings, ctx.remoteHostId)
-          : undefined;
-        let subagentRoute = subagentModelSettings === storedSubagentModelSettings
-          ? configuredSubagentRoute
-          : undefined;
-        let forceDisableSubagents = false;
-        if (codexSubagentRouteResolutionFailed(subagentModelSettings, subagentRoute, {
-          remoteHostId: ctx.remoteHostId,
-          isReview,
-        })) {
-          // 未显式保存 Provider 时依赖目录做隐式解析。解析失败不能继承父任务来源继续
-          // 运行，否则默认子代理模型会静默跑到错误上游。
-          desktopMakerLogger.warn(
-            'Codex subagents disabled: configured model Provider route could not be resolved',
-            { catalogModel: subagentModelSettings.codex?.trim() },
-          );
-          forceDisableSubagents = true;
-        } else if (subagentRoute && !ready) {
-          // proxy 未就绪时 fallback 会直连真实 Gateway，无法兑现冻结的 Provider、
-          // upstream、鉴权与模型恢复。fail-closed：本 app-server 关闭子代理，父任务
-          // 仍可沿既有 Gateway fallback 工作；路由快照也不注册。
-          desktopMakerLogger.warn(
-            'Codex subagents disabled: configured Provider route requires unavailable proxy',
-            { providerId: subagentRoute.providerId, catalogModel: subagentRoute.catalogModel },
-          );
-          forceDisableSubagents = true;
-          subagentRoute = undefined;
-        } else if (subagentRoute) {
-          const hasRequiredOAuth = codexSubagentRouteUsesChatGptOAuth(
-            subagentRoute,
-            subagentProviderViews,
-          )
-            ? await desktopCodexAuthAdapter.hasCodexOAuthLogin().catch(() => false)
-            : false;
-          const credentialPlan = resolveCodexSubagentHostCredentialPlan(
-            subagentRoute,
-            subagentProviderViews,
-            credentialMode,
-            hasRequiredOAuth,
-          );
-          if (credentialPlan.forceDisableSubagents) {
+        const storedSubagentModelSettings = readSubagentModelSettings();
+        let smartSubagentConfig: CodexSmartSubagentConfig | undefined;
+        if (
+          !isControlPlane
+          && !isReview
+          && ready
+          && storedSubagentModelSettings.codexSmartSubagentRouting
+        ) {
+          try {
+            const providerViews: ProviderView[] =
+              await getDesktopProviderService().listProviders({ allowSideEffects: false });
+            smartSubagentConfig = prepareCodexSmartSubagentConfig({
+              codexHome: getCodexHome(),
+              providerViews,
+              allowChatGptOAuth: authInjection === 'oauth-bearer',
+              catalogRevision: getActiveCatalogRevision(),
+            }) ?? undefined;
+          } catch (err) {
             desktopMakerLogger.warn(
-              'Codex subagents disabled: configured Provider route requires unavailable ChatGPT OAuth',
-              { providerId: subagentRoute.providerId, catalogModel: subagentRoute.catalogModel },
+              'Codex smart Subagent catalog unavailable; preserving native routing',
+              { error: err instanceof Error ? err.message : String(err) },
             );
-            forceDisableSubagents = true;
-            subagentRoute = undefined;
-          } else if (credentialPlan.requiredSpawnCredentialMode) {
-            return {
-              extraArgs: [],
-              extraEnv: {},
-              requiredSpawnCredentialMode: credentialPlan.requiredSpawnCredentialMode,
-              codexProxyActive: ready,
-            };
           }
         }
+        let customContextCatalogArgs: string[] = [];
+        if (isCustomContext) {
+          const modelId = ctx.customContextModel?.trim();
+          const contextWindow = ctx.customContextWindow;
+          try {
+            if (
+              !modelId ||
+              typeof contextWindow !== 'number' ||
+              !Number.isFinite(contextWindow) ||
+              contextWindow <= 0
+            ) {
+              throw new Error('custom-context Codex host is missing its model or context window');
+            }
+            const customCatalog = await prepareCodexCustomContextCatalog({
+              binaryPath: codexPath,
+              codexHome: getCodexHome(),
+              modelId,
+              contextWindow,
+              ...(smartSubagentConfig
+                ? { baseCatalog: smartSubagentConfig.modelCatalog }
+                : {}),
+            });
+            if (smartSubagentConfig) {
+              smartSubagentConfig = {
+                ...smartSubagentConfig,
+                catalogPath: customCatalog.catalogPath,
+              };
+            } else {
+              customContextCatalogArgs = customCatalog.extraArgs;
+            }
+          } catch (error) {
+            await releaseCodexCustomContextProxy(customContextHostKey);
+            const fatal = error instanceof Error ? error : new Error(String(error));
+            (fatal as { codexSpawnConfigFatal?: boolean }).codexSpawnConfigFatal = true;
+            throw fatal;
+          }
+        }
+        const codexSubagentRoutingProfile = resolveCodexSubagentRoutingProfile(
+          storedSubagentModelSettings,
+          smartSubagentConfig,
+        );
         return {
-          // 子代理护栏/默认模型每次 createHost 现读 store:DeferredCodexRestart 兑现
-          // (dispose host)后的新 spawn 自动带新值。agents.* 对 control-plane 的
-          // model/list 无影响,不加 hostPurpose 分支。
+          // 默认不碰 Codex 原生 Sol/Terra 调配。用户开启智能调配后才为这个本地
+          // app-server 冻结扩展目录与逐模型 Provider 路由。
           extraArgs: [
             ...mcpExtraArgs,
             ...(!isReview && !ctx.remoteHostId
-              ? buildCodexSubagentSpawnArgs(subagentModelSettings, subagentRoute, {
-                  forceDisableSubagents,
-                })
+              ? buildCodexSubagentSpawnArgs(storedSubagentModelSettings, smartSubagentConfig)
               : []),
+            ...customContextCatalogArgs,
             ...buildCodexProxySpawnArgs(endpoint, authInjection),
+            ...codexCustomProviderSpawn.extraArgs,
           ],
-          extraEnv: mcpExtraEnv,
-          ...(subagentModelFallback ? { subagentModelFallback } : {}),
-          ...(subagentRoute ? { subagentRoute } : {}),
+          extraEnv: { ...mcpExtraEnv, ...codexCustomProviderSpawn.extraEnv },
+          ...(smartSubagentConfig
+            ? { smartSubagentRoutes: smartSubagentConfig.routes }
+            : {}),
           ...(buildSessionMcpConfig ? { buildSessionMcpConfig } : {}),
           codexProxyActive: ready,
           codexOpenAiWebSocketsEnabled: useOAuthBearer && ready,
           codexSubagentRoutingProfile,
+          ...(smartSubagentConfig
+            ? { codexSubagentRoutingSignature: smartSubagentConfig.routingSignature }
+            : {}),
+          ...(codexCustomProviderRoutes.length > 0
+            ? { codexCustomProviderRoutes: toCodexCustomProviderHostRoutes(codexCustomProviderRoutes) }
+            : {}),
           codexBrowserUseAvailable: browserCompanionSpawnConfig.codexBrowserUseAvailable,
           ...(browserCompanion?.status === 'ready'
             ? {
@@ -1568,6 +1637,12 @@ export function getMaker(): Maker {
           // oauth spawn 额外定义订阅直连 identity；Cindy codex/* 使用上面的 HTTP identity。
           ...(useOAuthBearer && ready
             ? { codexRemoteCompactionProviderId: CODEX_OPENAI_COMPACT_PROVIDER_ID }
+            : {}),
+          ...(isCustomContext
+            ? {
+                onHostRetired: () =>
+                  releaseCodexCustomContextProxy(customContextHostKey),
+              }
             : {}),
         };
       },
@@ -1609,10 +1684,14 @@ export function getMaker(): Maker {
         threadId,
         text,
         subagentRoute,
+        smartSubagentRoutes,
       }) =>
         registerCodexProxyComposed(sessionId, threadId, text, {
           ...(subagentRoute ? { subagentRoute } : {}),
+          ...(smartSubagentRoutes ? { smartSubagentRoutes } : {}),
         }),
+      getCodexSubagentIdentity: ({ childThreadId }) =>
+        getObservedCodexSubagentIdentity(childThreadId),
       armCodexHttpRecovery,
       registerCodexChildThreadForParent: ({ parentThreadId, childThreadId }) => {
         registerCodexProxyChildThread(parentThreadId, childThreadId);
@@ -2319,6 +2398,7 @@ export function registerPiAgentIfAvailable(): boolean {
  */
 export function resetMaker(): void {
   cancelCodexAuthModeChange();
+  setCodexAppliedCustomProviderRoutes([]);
   _maker = null;
   _registerPiAgent = null;
   _codexAgent = null;
@@ -2395,6 +2475,32 @@ export async function prepareCodexForAuthModeChange(): Promise<void> {
       }
     }
     guard?.assertIdle();
+    _codexCredentialChangeGuard = guard;
+    prepared = true;
+  } finally {
+    if (!prepared) {
+      guard?.release();
+    }
+  }
+}
+
+/**
+ * Hold the shared local Codex Host change guard and force-retire that Host before a custom
+ * Provider route or credential is persisted. Forced retirement closes all attached local Codex
+ * sessions at once; remote Codex and other agents use different Hosts and are unaffected.
+ */
+export async function prepareCodexForCustomProviderHostChange(): Promise<void> {
+  if (_codexCredentialChangeGuard) {
+    throw new Error('Codex credential mode change is already in progress');
+  }
+  const guard = _codexAgent
+    ? await _codexAgent.beginLocalHostCredentialChange(
+        'Codex custom Provider route or credential changed',
+      )
+    : null;
+  let prepared = false;
+  try {
+    await guard?.retireActiveHost();
     _codexCredentialChangeGuard = guard;
     prepared = true;
   } finally {

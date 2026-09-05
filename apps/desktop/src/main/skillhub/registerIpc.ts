@@ -4,10 +4,15 @@ import type { Maker } from '@cindy/maker-core';
 import { BrowserWindow, dialog, ipcMain } from 'electron';
 import { getCurrentDataOwnerId } from '../authManager';
 import { isAppSessionBoundaryPending } from '../appSessionState';
-import { ensureReady as ensureLocalDbReady, getRawDb } from '../localDb';
+import { ensureReady as ensureLocalDbReady } from '../localDb';
+import {
+  getCurrentDbClientSnapshot,
+  type CurrentDbClientSnapshot,
+} from '../localDb/client/current.js';
 import { createLogger } from '../logger';
 import { assertTrustedAppRendererEvent } from '../security/trustedAppRenderer.js';
 import { normalizeWorkingDirForStorage } from '../../shared/workingDir.js';
+import { isSkillhubCatalogScope } from '../../shared/skillhubCatalog.js';
 import { computeFolderHashDetailed } from './folderHash';
 import { type MdKind, parseAndValidateFrontmatter } from './frontmatterValidation';
 import * as importLocalSkill from './importLocalSkill';
@@ -240,8 +245,28 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
     onProgress: broadcastPublishProgress,
   });
   let usageRefreshBroadcastPromise: Promise<void> | null = null;
-  const scheduleUsageAnalyticsRefresh = (db: ReturnType<typeof getRawDb>) => {
-    const promise = requestLocalSkillUsageAnalyticsRefresh(db);
+  const captureUsageDbSnapshot = (): CurrentDbClientSnapshot => {
+    if (isAppSessionBoundaryPending()) {
+      throw new Error('localDb not ready: app session is switching');
+    }
+    const snapshot = getCurrentDbClientSnapshot();
+    if (!snapshot) throw new Error('DbClient not ready');
+    return snapshot;
+  };
+  const assertUsageDbSnapshotCurrent = (snapshot: CurrentDbClientSnapshot): void => {
+    const current = getCurrentDbClientSnapshot();
+    if (
+      isAppSessionBoundaryPending()
+      || !current
+      || current.client !== snapshot.client
+      || current.clientEpoch !== snapshot.clientEpoch
+      || current.userId !== snapshot.userId
+    ) {
+      throw new Error('localDb not ready: app session switched during Skill usage query');
+    }
+  };
+  const scheduleUsageAnalyticsRefresh = (snapshot: CurrentDbClientSnapshot) => {
+    const promise = requestLocalSkillUsageAnalyticsRefresh(snapshot.client);
     if (!promise || usageRefreshBroadcastPromise === promise) return;
     usageRefreshBroadcastPromise = promise;
     void promise
@@ -249,7 +274,15 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
         log.warn('[skillhub:usage-refresh] failed:', err instanceof Error ? err.message : String(err));
       })
       .finally(() => {
-        broadcastUsageAnalyticsRefreshed();
+        const current = getCurrentDbClientSnapshot();
+        if (
+          !isAppSessionBoundaryPending()
+          && current?.client === snapshot.client
+          && current.clientEpoch === snapshot.clientEpoch
+          && current.userId === snapshot.userId
+        ) {
+          broadcastUsageAnalyticsRefreshed();
+        }
         if (usageRefreshBroadcastPromise === promise) usageRefreshBroadcastPromise = null;
       });
   };
@@ -376,7 +409,7 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
   // ── SkillHub market broker IPC ───────────────────────────────────────────
   ipcMain.handle(
     'skillhub:sync',
-    async (_event, params: { slugs?: string[] } | undefined) => {
+    async (_event, params: { skills?: unknown; slugs?: string[] } | undefined) => {
       try {
         return await marketService.sync(params);
       } catch (err) {
@@ -402,9 +435,9 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
 
   ipcMain.handle(
     'skillhub:info',
-    async (_event, { name }: { name: string }) => {
+    async (_event, { name, catalogScope }: { name: string; catalogScope?: unknown }) => {
       try {
-        return await marketService.info(name);
+        return await marketService.info(name, isSkillhubCatalogScope(catalogScope) ? catalogScope : undefined);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         const code = (err as { code?: string }).code;
@@ -418,9 +451,13 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
 
   ipcMain.handle(
     'skillhub:get-published-files',
-    async (_event, params: { name: string; version?: string }) => {
+    async (_event, params: { name: string; version?: string; catalogScope?: unknown }) => {
       try {
-        return await marketService.getPublishedFiles(params);
+        return await marketService.getPublishedFiles({
+          name: params.name,
+          ...(params.version !== undefined ? { version: params.version } : {}),
+          ...(isSkillhubCatalogScope(params.catalogScope) ? { catalogScope: params.catalogScope } : {}),
+        });
       } catch (err) {
         return skillhubIpcError(err);
       }
@@ -429,9 +466,14 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
 
   ipcMain.handle(
     'skillhub:read-published-file',
-    async (_event, params: { name: string; path: string; version?: string }) => {
+    async (_event, params: { name: string; path: string; version?: string; catalogScope?: unknown }) => {
       try {
-        return await marketService.readPublishedFile(params);
+        return await marketService.readPublishedFile({
+          name: params.name,
+          path: params.path,
+          ...(params.version !== undefined ? { version: params.version } : {}),
+          ...(isSkillhubCatalogScope(params.catalogScope) ? { catalogScope: params.catalogScope } : {}),
+        });
       } catch (err) {
         return skillhubIpcError(err);
       }
@@ -440,9 +482,9 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
 
   ipcMain.handle(
     'skillhub:list-published-versions',
-    async (_event, { name }: { name: string }) => {
+    async (_event, { name, catalogScope }: { name: string; catalogScope?: unknown }) => {
       try {
-        return await marketService.listPublishedVersions(name);
+        return await marketService.listPublishedVersions(name, isSkillhubCatalogScope(catalogScope) ? catalogScope : undefined);
       } catch (err) {
         return skillhubIpcError(err);
       }
@@ -487,9 +529,13 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
 
   ipcMain.handle(
     'skillhub:set-published-visibility',
-    async (_event, params: Parameters<SkillhubMarketService['setPublishedVisibility']>[0]) => {
+    async (_event, params: Omit<Parameters<SkillhubMarketService['setPublishedVisibility']>[0], 'previousCatalogScope'> & { previousCatalogScope?: unknown }) => {
       try {
-        return await marketService.setPublishedVisibility(params);
+        const { previousCatalogScope, ...fields } = params;
+        return await marketService.setPublishedVisibility({
+          ...fields,
+          ...(isSkillhubCatalogScope(previousCatalogScope) ? { previousCatalogScope } : {}),
+        });
       } catch (err) {
         return skillhubIpcError(err);
       }
@@ -531,9 +577,12 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
   // Market 分类列表 — 若 broker / 网络不可用，降级空数组
   ipcMain.handle(
     'skillhub:list-categories',
-    async () => {
+    async (_event, params?: { scope?: 'market' | 'team' }) => {
       try {
-        return await marketService.listCategories();
+        // Renderer payload is untrusted: only the two catalog scopes are valid,
+        // and an absent/invalid value keeps the historical market behavior.
+        const scope = params?.scope === 'team' ? 'team' : 'market';
+        return await marketService.listCategories(scope);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         log.warn('list-categories failed', message);
@@ -559,9 +608,13 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
   // 查询发布后的安全扫描状态（renderer 轮询用）
   ipcMain.handle(
     'skillhub:get-scan-status',
-    async (_event, params: { slug: string; version?: string }) => {
+    async (_event, params: { slug: string; version?: string; catalogScope?: unknown }) => {
       try {
-        return await marketService.getScanStatus(params);
+        return await marketService.getScanStatus({
+          slug: params.slug,
+          ...(params.version !== undefined ? { version: params.version } : {}),
+          ...(isSkillhubCatalogScope(params.catalogScope) ? { catalogScope: params.catalogScope } : {}),
+        });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         return { success: false, error: message, status: 'unknown' };
@@ -634,12 +687,15 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
           if (raw.success) currentSkillContent = raw.content ?? null;
         }
         const readSummary = async () => {
-          if (isAppSessionBoundaryPending()) {
-            throw new Error('localDb not ready: app session is switching');
-          }
-          const db = getRawDb();
-          scheduleUsageAnalyticsRefresh(db);
-          return await getLocalSkillUsageSummary({ skillName: name, currentSkillContent, db });
+          const snapshot = captureUsageDbSnapshot();
+          scheduleUsageAnalyticsRefresh(snapshot);
+          const result = await getLocalSkillUsageSummary({
+            skillName: name,
+            currentSkillContent,
+            client: snapshot.client,
+          });
+          assertUsageDbSnapshotCurrent(snapshot);
+          return result;
         };
         try {
           return await readSummary();
@@ -667,24 +723,24 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
           const raw = await readSkillRawFile({ filePath: mdPath });
           if (raw.success) currentSkillContent = raw.content ?? null;
         }
-        try {
-          if (isAppSessionBoundaryPending()) {
-            return { success: false, error: 'localDb not ready: app session is switching' };
-          }
-          return await getLocalSkillUsageDiagnosisContext({
+        const readDiagnosisContext = async () => {
+          const snapshot = captureUsageDbSnapshot();
+          const result = await getLocalSkillUsageDiagnosisContext({
             skillName: name,
             currentSkillContent,
             skillPath: mdPath ?? null,
+            client: snapshot.client,
           });
+          assertUsageDbSnapshotCurrent(snapshot);
+          return result;
+        };
+        try {
+          return await readDiagnosisContext();
         } catch (err) {
           if (!isLocalDbNotReady(err)) throw err;
           const ready = await ensureSkillUsageLocalDbReady();
           if (!ready.success) return ready;
-          return await getLocalSkillUsageDiagnosisContext({
-            skillName: name,
-            currentSkillContent,
-            skillPath: mdPath ?? null,
-          });
+          return await readDiagnosisContext();
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -800,6 +856,7 @@ export function registerSkillhubIpc(options: RegisterSkillhubIpcOptions): void {
       const publicParams: import('./installService').InstallParams = {
         name: params.name,
         ...(params.version !== undefined ? { version: params.version } : {}),
+        ...(isSkillhubCatalogScope(params.catalogScope) ? { catalogScope: params.catalogScope } : {}),
         ...(params.force !== undefined ? { force: params.force } : {}),
         ...(params.installPath !== undefined ? { installPath: params.installPath } : {}),
         ...(params.skipBackup !== undefined ? { skipBackup: params.skipBackup } : {}),

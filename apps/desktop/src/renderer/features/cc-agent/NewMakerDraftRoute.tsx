@@ -3,7 +3,7 @@
  * ---------------------------------------------------------------------------
  * 职责:
  *   1. 从 newMakerDraft store 读取 vendor / workingDir / lastByVendor
- *   2. 渲染 CREATE AGENT 主区:lockup + ChatInput(sessionId=undefined) + 快速开始
+ *   2. 渲染 CREATE AGENT 主区:lockup + ChatInput(sessionId=undefined) + 首页建议行
  *   3. 用户切 vendor → switchVendor() 保留已同步的当前 prefs 并切到新 vendor，
  *      ChatInput 的 initialModel/Effort/PermissionMode 自动
  *      由 lastByVendor[newVendor] 提供
@@ -62,9 +62,9 @@ import {
 import { useHasAnyRemoteTarget } from '@/hooks/useHasAnyReadyRemoteHost';
 import { useSelectableDevices } from '@/hooks/useControllableDevices';
 import { useProviderOnboarding } from '@/hooks/useProviderOnboarding';
-import { ConnectProviderCard } from '@/components/onboarding/ConnectProviderCard';
 import { InheritedSubscriptionNotice } from '@/components/onboarding/InheritedSubscriptionNotice';
 import { PromotionalGrantNotice } from '@/components/onboarding/PromotionalGrantNotice';
+import { HomeZeroModelAction } from './HomeZeroModelAction';
 import { resolveDeviceLinkSubmission } from './deviceLinkCreateArgs';
 import { commitRemoteSessionHandoff } from './remoteSessionHandoff';
 import { remoteProjectsStore } from '@/features/device-link/remoteProjectsStore';
@@ -117,7 +117,6 @@ import {
   setProviderModelFast,
   useProviderModelMemoryVersion,
 } from '@/state/providerModelMemory';
-import { useModelPickerLayout } from '@/state/modelPickerLayout';
 import {
   rememberRecoverableHandoff,
   setPending,
@@ -174,15 +173,13 @@ import {
 } from './deferredUiAssignment';
 import { CrossAgentConvertDialog } from '@/components/ui/cross-agent-convert-dialog';
 import type { MakerVendor } from '@/lib/ccAgent.types';
+import { ChevronDown, MessageSquare, MonitorSmartphone } from 'lucide-react';
+import { HomeSuggestionList } from './HomeSuggestionList';
 import {
-  ChevronDown,
-  Code2,
-  Hammer,
-  MessageSquare,
-  MessageSquareCode,
-  MonitorSmartphone,
-  SearchCode,
-} from 'lucide-react';
+  type HomeSuggestionId,
+  homeSuggestionLabelKey,
+  homeSuggestionPromptKey,
+} from './homeSuggestions';
 import type { Effort, PermissionMode } from '@/lib/userPreferences.types';
 import {
   categorizeByFilename,
@@ -489,29 +486,6 @@ function draftEnableOrcaOptions(
   };
 }
 
-const createAgentQuickStarts = [
-  {
-    key: 'explore',
-    labelKey: 'newChat.createAgent.quickStarts.explore',
-    icon: SearchCode,
-  },
-  {
-    key: 'build',
-    labelKey: 'newChat.createAgent.quickStarts.build',
-    icon: Code2,
-  },
-  {
-    key: 'review',
-    labelKey: 'newChat.createAgent.quickStarts.review',
-    icon: MessageSquareCode,
-  },
-  {
-    key: 'fix',
-    labelKey: 'newChat.createAgent.quickStarts.fix',
-    icon: Hammer,
-  },
-] as const;
-
 /**
  * 草稿态没有 sessionId,附件有两种"寄居"形态,lazy-create 出 sessionId 之后
  * 都要迁回真实会话:
@@ -684,7 +658,6 @@ export function NewMakerDraftRoute() {
   // viewport itself remains wide. Keep the draft layout responsive to that
   // actual content width rather than relying on viewport breakpoints.
   const isDraftNarrow = inputWidthBand === 0;
-  const isDraftMedium = inputWidthBand <= 2;
   // Keep the full vendor switcher while the composer still has room for it.
   // Icon-only mode is reserved for the tighter toolbar state, not merely a
   // moderately narrow content rail (for example, when attachments are present).
@@ -1292,17 +1265,10 @@ export function NewMakerDraftRoute() {
     unsupported: deviceProvidersUnsupported,
   } = useDeviceProviders(effectiveDeviceLinkDeviceId);
   const providers = effectiveDeviceLinkDeviceId ? deviceProviders : localProviders;
-  // 统一面板的启用判据是**两级**,与 ChatInput 的 unifiedPanelCapable / unifiedPanelActive
-  // 一一对应,工具条的引擎下拉必须按后者(active)决定去留:
-  //   · capable(本变量)—— 联合列表只认供应商目录,老被控端(不支持 provider:list)只有
-  //     一份拍平 capabilities → 开了就是空列表,composer 那边会降级回旧面板;
-  //   · active —— 再叠上形态偏好(modelPickerLayout,默认 'classic' = A 版统一选择器)。
-  // 旧面板是「先选引擎再选模型」,所以只要没真正启用统一面板,就必须把工具条上的引擎下拉
-  // 还回来 —— 否则那条链路上根本换不了引擎(只按 capable 撤掉时,默认形态下的新建草稿
-  // 就彻底没有换引擎入口)。统一面板真启用时不注入(引擎跟着模型走)。
+  // 新旧用户统一使用 A。老被控端只有 capabilities、没有供应商目录时，
+  // 保留兼容列表与引擎下拉；否则联合列表会为空，也无法切换引擎。
   const unifiedModelPanelEnabled = !effectiveDeviceLinkDeviceId || !deviceProvidersUnsupported;
-  const modelPickerLayoutPref = useModelPickerLayout();
-  const unifiedModelPanelActive = unifiedModelPanelEnabled && modelPickerLayoutPref !== 'original';
+  const unifiedModelPanelActive = unifiedModelPanelEnabled;
   const remoteModelListStatus = !isDeviceLinkDraft
     ? 'idle'
     : capabilitiesError || (deviceProvidersError && !deviceProvidersUnsupported)
@@ -2111,25 +2077,10 @@ export function NewMakerDraftRoute() {
   ]);
 
   // 收藏锚点的失效兜底:选中一条收藏后,如果草稿的 (模型, 来源) 又被别的路径改掉(引擎
-  // 不可用 coerce、模型校准、浮层里换来源…),这个锚点就不再描述当前选择了 —— 靠**派生**让
-  // 它不亮:比的是快照里的 (wire id, providerId) 与草稿当前值。wire id 不查收藏条目(它按
-  // 归一化行 id 存,与草稿的 wire id 天生可能不等,见 draftFavoriteAnchor 的说明);
-  // **来源必须比**(2026-08-19 review P1):同一 wire model 可来自多家供应商,只比 wire id,
-  // device-link seed / 另一窗口把草稿从来源 A 切到同 wire model 的来源 B 后,旧锚点会继续
-  // 勾着 A 的收藏并抑制 B 模型行的勾,之后编辑 / 删除的也是错误副本。引擎维度不必比:槽按
-  // 引擎分,读到的本来就是当前引擎那一格。锚点指向的收藏被删 / 换账号后查无此条的情形,
-  // 由面板侧 activeFavoriteUid 兜底。
-  //
-  // ★ 刻意**不做**「不符就把槽删掉」的清理 effect(2026-08-19 预审 P2-7):槽是持久化数据,
-  // 而 draftInitialModel / chatInitialProviderId 存在瞬态窗口 —— device-link 草稿在被控端
-  // seed 到达前暂用本地 chatPrefs 值,那一帧的失配会把用户真实的锚点**永久**删掉;两个窗口
-  // (本地草稿 × 远程草稿)共用同一引擎槽时也会互删。派生「不符不亮」已保证不会勾错;
-  // 显式选择(选普通模型行 → handleUnifiedDraftSelect 写 null)仍会清槽。留下的休眠锚点
-  // 只在 (模型, 来源) 改回那一刻重新亮起 —— 那本来就是用户对该配置最后一次显式选中的副本。
-  // 收藏是独立选中项(Chris 2026-08-20):勾选身份就是 uid,不拿草稿当前模型/来源去对
-  // 快照 —— 对不上就不勾,等于让下面同名模型行把焦点抢走。草稿模型被 coerce / seed
-  // 改走时收藏行仍是用户点过的那一条;显式点普通模型行才会经 handleUnifiedDraftSelect
-  // 把槽写成 null。条目被删 / 换账号由面板 activeFavoriteUid 兜底。
+  // 不可用 coerce、模型校准、浮层里换来源…)，面板会用当前收藏与草稿完整配置比对，
+  // 不一致就回落模型行。深度 / Fast 直接读实时值，不在锚点里复制第二份快照。
+  // 不做「不符就删槽」的 effect：目录 / 远端 seed 未到时的短暂失配不能抹掉历史选择。
+  // 收藏修改不会自动覆盖旧草稿；显式选普通模型行时才清掉该锚点。
   const selectedFavoriteUid = draftFavoriteAnchor?.uid ?? null;
 
   /**
@@ -3027,6 +2978,7 @@ export function NewMakerDraftRoute() {
   // ref 负责同步 guard，state 只负责驱动 UI 禁用；所有写入都经 markSendInFlight，
   // 避免其中一半提前释放后让旧草稿目标被消费。
   const sendInFlightRef = useRef(false);
+  const pendingHomePromptRef = useRef<string | null>(null);
   const [sendInFlight, setSendInFlight] = useState(false);
   const markSendInFlight = useCallback((value: boolean) => {
     sendInFlightRef.current = value;
@@ -5081,18 +5033,61 @@ export function NewMakerDraftRoute() {
     return proceed;
   }, [vendorAuthGate]);
 
-  const handleQuickStart = useCallback(
-    (labelKey: (typeof createAgentQuickStarts)[number]['labelKey']) => {
-      const text = t(labelKey);
+  const handleComposerSend = useCallback(
+    (
+      message: string,
+      model: string,
+      effort: Effort,
+      permissionMode: PermissionMode,
+      files?: Parameters<typeof handleSend>[4],
+      mentions?: Parameters<typeof handleSend>[5],
+      opts?: Parameters<typeof handleSend>[6],
+    ) => {
+      const payload = pendingHomePromptRef.current ?? message;
+      pendingHomePromptRef.current = null;
+      return handleSend(payload, model, effort, permissionMode, files, mentions, opts);
+    },
+    [handleSend],
+  );
+
+  const handleHomeSuggestion = useCallback(
+    (id: HomeSuggestionId) => {
+      const label = t(homeSuggestionLabelKey(id));
+      const prompt = t(homeSuggestionPromptKey(id));
       const currentDraft = getComposerDraft(NEW_MAKER_DRAFT_KEY);
       saveComposerDraft(NEW_MAKER_DRAFT_KEY, {
-        text: quickStartTextToTiptapDoc(text),
+        text: quickStartTextToTiptapDoc(label),
         attachments: currentDraft?.attachments ?? attachmentState.attachments,
         quotes: currentDraft?.quotes,
         browserComments: currentDraft?.browserComments,
       });
+      const pendingPrompt = prompt;
+      pendingHomePromptRef.current = pendingPrompt;
+      void handleSend(
+        prompt,
+        draftInitialModel,
+        (draftInitialEffort ?? 'medium') as Effort,
+        chatInitialPermissionMode,
+        attachmentState.attachments,
+        undefined,
+        { providerId: chatInitialProviderId },
+      ).finally(() => {
+        // 清理失败路径上的完整 prompt，避免下一次普通发送被旧建议稿覆盖。
+        // 用值校验保护连续点击两条建议时后一次 pending prompt。
+        if (pendingHomePromptRef.current === pendingPrompt) {
+          pendingHomePromptRef.current = null;
+        }
+      });
     },
-    [attachmentState.attachments, t],
+    [
+      attachmentState.attachments,
+      chatInitialPermissionMode,
+      chatInitialProviderId,
+      draftInitialEffort,
+      draftInitialModel,
+      handleSend,
+      t,
+    ],
   );
 
   // 注意:不要给 ChatInput 加 key 强制 remount。ChatInput 内部 activeModel /
@@ -5200,9 +5195,7 @@ export function NewMakerDraftRoute() {
               showProviderOnboardingCard && 'overflow-y-auto pb-8',
               isDraftNarrow
                 ? 'px-4 pt-[calc(max(64px,18vh)_+_32px_-_var(--content-header-h,46px))]'
-                : showProviderOnboardingCard
-                  ? 'px-8 pt-[calc(max(56px,10vh)_+_46px_-_var(--content-header-h,46px))]'
-                  : 'px-8 pt-[calc(max(96px,28vh)_+_46px_-_var(--content-header-h,46px))]',
+                : 'px-8 pt-[calc(max(96px,28vh)_+_46px_-_var(--content-header-h,46px))]',
             )}
           >
             <div
@@ -5313,7 +5306,7 @@ export function NewMakerDraftRoute() {
               >
                 <div className="w-full">
                   <ChatInput
-                    onSend={handleSend}
+                    onSend={handleComposerSend}
                     onBeforeVoiceInputStart={handleBeforeVoiceInputStart}
                     externalDragOver={pageDragOver}
                     visualVariant="create-agent"
@@ -5343,10 +5336,8 @@ export function NewMakerDraftRoute() {
                     showFolderPicker={false}
                     // 统一模型选择器(model-selector-unified §1.1):引擎不再是工具条上的
                     // 独立控件 —— 它跟着模型走(推荐映射自动配好,并在模型 pill 与每一行
-                    // 右侧常驻显示),高级调整收进行配置浮层。两条例外都由
-                    // unifiedModelPanelActive 表达:device-link 老被控端的 capabilities-only
-                    // 降级、以及形态偏好停在 'original'(默认档)—— 那两路 composer 都回落
-                    // 旧面板,引擎下拉必须一起回来。
+                    // 右侧常驻显示),高级调整收进行配置浮层。仅在老被控端
+                    // capabilities-only 降级时恢复独立引擎下拉。
                     middleToolbarSlot={
                       unifiedModelPanelActive ? undefined : (
                         <AgentSelect
@@ -5478,84 +5469,23 @@ export function NewMakerDraftRoute() {
                     </span>
                   </div>
                 )}
-                {/* 零可用模型 → 快速开始换成「连接供应商」引导卡(互斥:此时快捷入口
-                    只会把 prompt 填进发不出去的输入框;device-link 草稿由上方 chip 负责,
-                    引导卡自身有 !isDeviceLinkDraft gate)。dismiss / 连上后恢复快捷入口。 */}
+                {/* 零可用模型 → states.html B:单行动卡,不铺供应商清单。 */}
                 {showProviderOnboardingCard && (
-                  <div className="mt-8 w-full" style={{ maxWidth: 800 }}>
-                    <ConnectProviderCard />
-                  </div>
+                  <HomeZeroModelAction
+                    authMode={providerOnboarding.authMode}
+                    narrow={isDraftNarrow}
+                  />
                 )}
-                {/* 「已沿用本机订阅」一次性告知。与上面的引导卡条件互斥(它要求零已连接
-                    来源,而继承成功后该供应商已连接),所以不与快捷入口互斥 —— 告知不是
-                    待办,不该把快速开始顶掉。device-link 草稿不出:连接态在被控端。
-                    间距挂在组件自身:外层包一层 div 会在它不可见时留下一段空白 margin。 */}
                 <InheritedSubscriptionNotice
                   enabled={!isDeviceLinkDraft}
                   className="mt-6 self-stretch"
                 />
-                {/* 「赠送余额已到账」一次性告知。与上面那条**不互斥**:两者都是告知,同时成立
-                    时按发生顺序竖排(先讲用的是哪个账号,再讲账上有多少钱),都不与快速开始
-                    互斥。device-link 草稿不出:那条对话跑在被控端,本机账号的赠送与它无关。
-                    间距同样挂在组件自身,免得它不可见时留下一段空白 margin。 */}
                 <PromotionalGrantNotice
                   enabled={!isDeviceLinkDraft}
                   className="mt-6 self-stretch"
                 />
-                {/* 快捷入口与输入框同宽:左右两缘都与上方 ChatInput 对齐(父列已封顶
-                    inputWidth)。此前封顶 800px 会在宽窗口下右缘短一截,视觉上没对齐
-                    (2026-07-24 用户反馈)。 */}
                 {!showProviderOnboardingCard && (
-                  <div data-testid="create-agent-quick-starts" className="mt-[42px] w-full">
-                    {/* 标题字号 12→14px(DESIGN §3 Caption),与卡片间距 16→10px 收近
-                        (DESIGN §5 间距档)——用户改稿 2026-07-22。 */}
-                    <div className="mb-2.5 px-0.5">
-                      <div className="text-14 font-medium leading-[1.286] text-[var(--text-secondary)]">
-                        {t('newChat.createAgent.quickStart')}
-                      </div>
-                    </div>
-                    <div
-                      className={cn(
-                        'grid w-full gap-3',
-                        isDraftNarrow
-                          ? 'grid-cols-1'
-                          : isDraftMedium
-                            ? 'grid-cols-2'
-                            : 'grid-cols-4',
-                      )}
-                    >
-                      {createAgentQuickStarts.map(({ key, labelKey, icon: Icon }) => (
-                        <button
-                          key={key}
-                          type="button"
-                          onClick={() => handleQuickStart(labelKey)}
-                          // 圆角与输入框统一为 12px(DESIGN §5 容器档,rounded-xl)。
-                          // 用户改稿 2026-07-25:两档统一竖排——icon 固定卡片左上(距顶/
-                          // 距左均等于 p-3/p-4 内边距),文字挪到卡片中下方、与 icon 左对齐
-                          // (flex-col + justify-between,icon 顶、文字底;gap-1 兜底竖向
-                          // 最小间距),取代原窄态横排 / 常态竖排自适应(#562)。
-                          // 卡片高度不变(narrow 84 / 常态 112)。
-                          className={cn(
-                            'group flex flex-col items-start justify-between gap-1 rounded-xl border border-[var(--create-agent-quick-card-border)] bg-[var(--create-agent-quick-card-bg)] text-left text-[var(--create-agent-quick-card-text)] transition-colors hover:bg-[var(--create-agent-quick-card-bg-hover)]',
-                            isDraftNarrow ? 'min-h-[84px] p-3' : 'min-h-[112px] p-4',
-                          )}
-                        >
-                          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[var(--create-agent-quick-card-icon-bg)]">
-                            <Icon
-                              size={16}
-                              strokeWidth={2}
-                              className="text-[var(--create-agent-quick-card-icon)]"
-                            />
-                          </span>
-                          {/* 字号 13px 与左侧会话列表(text-13)一致——用户改稿 2026-07-22。
-                              竖排下占满卡片宽度、左对齐 icon,靠父列 justify-between 贴底。 */}
-                          <span className="w-full min-w-0 text-13 font-semibold leading-[1.231]">
-                            {t(labelKey)}
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
+                  <HomeSuggestionList narrow={isDraftNarrow} onSelect={handleHomeSuggestion} />
                 )}
                 {/* 首页「新建目标」弹窗:无 sessionId → onCreate 建会话并 setGoal(见 handleCreateGoal)。
                 initialObjective = 点「新建目标」时输入框里已有的文字。 */}

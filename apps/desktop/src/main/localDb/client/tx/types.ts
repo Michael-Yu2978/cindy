@@ -29,6 +29,7 @@ export type DbTxName =
   | 'message.delete'
   | 'im.deleteBindings'
   | 'im.replaceBinding'
+  | 'im.rotateSession'
   | 'wechatActivateBindingEpoch'
   | 'wechatCommitPollBatch'
   | 'wechatLeaseNextTask'
@@ -46,6 +47,7 @@ export type DbTxName =
   | 'wechatPromoteTaskAttachments'
   | 'wechatRefreshOutboxContexts'
   | 'wechatUnbindCleanup'
+  | 'skillUsage.applyMutation'
   | 'session.importShare';
 
 export interface CodexImportMessagesArgs {
@@ -145,6 +147,8 @@ export interface ForkSessionArgs {
     updatedAt: number;
   };
   uuidMap: Array<[string, string]> | Record<string, string>;
+  /** Rebind copied provider-native fork anchors to the child vendor session. */
+  nativeForkAnchorSessionMap?: Array<[string, string]> | Record<string, string>;
   /** Legacy Claude imports may have stored transcript parentage in parentUuid. */
   legacyTranscriptParentUuids?: string[];
   /** Imported Claude assistant rows may retain an external tool-use parent id. */
@@ -164,6 +168,8 @@ export interface ForkSessionArgs {
    * 长度必须等于 source message 数。
    */
   newMessageIds: Array<{ id: string; clientId: string }>;
+  /** Persist a native-history recovery handoff atomically with the child and copied history. */
+  recoveryMarker?: { id: string; clientId: string; content: string; createdAt: number };
 }
 
 export interface EmbeddingMarkDoneArgs {
@@ -321,6 +327,14 @@ export interface ContextRebuildArgs {
   updatedAt: number;
   /** 读历史时看到的 sessions.cleared_at；提交时必须仍相同，否则 /clear 竞态整单回滚。 */
   expectedClearedAt?: number | null;
+  /** Same transaction as the durable handoff; source SDK ownership must still match. */
+  replacementRoute?: {
+    expectedSdkSessionId: string;
+    model: string;
+    providerId: string | null;
+    effort: string | null;
+    fastMode: boolean;
+  };
 }
 
 export interface MessageInsertArgs {
@@ -523,6 +537,37 @@ export interface ImDeleteBindingsArgs {
     userId: string;
     scopeKey: string;
   }>;
+}
+
+export interface ImRotateSessionArgs {
+  previousSessionId: string | null;
+  detachBinding: {
+    channel: string;
+    botContextId: string;
+    userId: string;
+    scopeKey: string;
+    targetSessionId: string;
+  } | null;
+  session: {
+    id: string;
+    title: string;
+    workingDir: string;
+    workspaceKind: 'project' | 'dialogue';
+    model: string;
+    effort: string;
+    permissionMode: string;
+    fastMode: boolean;
+    agentKind: string;
+    source: string;
+    providerId: string | null;
+    imBotContextId: string;
+    imUserId: string;
+  };
+  now: number;
+}
+
+export interface ImRotateSessionResult {
+  previousStatus: 'active' | 'archived' | 'deleted' | null;
 }
 
 export type WechatInboxStatus =
@@ -804,6 +849,44 @@ export interface WechatUnbindCleanupResult {
   filePaths: string[];
 }
 
+export type SkillUsageApplyMutationArgs =
+  | {
+      kind: 'persist';
+      source: {
+        rawFilePath: string;
+        analyzerVersion: string;
+        agentKind: string;
+        sessionId: string;
+        sdkSessionId: string;
+        mtimeMs: number;
+        sizeBytes: number;
+        scannedAt: number;
+      };
+      exposures: Array<{
+        id: string;
+        rawFilePath: string;
+        rawLineNo: number;
+        sessionId: string;
+        sdkSessionId: string;
+        agentKind: string;
+        skillName: string;
+        skillPath: string | null;
+        skillDocumentHash: string | null;
+        exposureContentHash: string;
+        documentHashSource: string;
+        source: string;
+        toolUseId: string | null;
+        seenAt: number;
+        toolCallCount: number;
+        repeatedToolCallCount: number;
+        toolErrorCount: number;
+        commandCallCount: number;
+        commandFailureCount: number;
+      }>;
+    }
+  | { kind: 'deleteBefore'; analyzerVersion: string; recentSince: number }
+  | { kind: 'promote'; analyzerVersion: string };
+
 export type DbTxArgsByName = {
   'codex.importMessages': CodexImportMessagesArgs;
   'claude.importMessages': ClaudeImportMessagesArgs;
@@ -835,6 +918,7 @@ export type DbTxArgsByName = {
   'message.delete': MessageDeleteArgs;
   'im.deleteBindings': ImDeleteBindingsArgs;
   'im.replaceBinding': ImReplaceBindingArgs;
+  'im.rotateSession': ImRotateSessionArgs;
   wechatActivateBindingEpoch: WechatActivateBindingEpochArgs;
   wechatCommitPollBatch: WechatCommitPollBatchArgs;
   wechatLeaseNextTask: WechatLeaseNextTaskArgs;
@@ -852,6 +936,7 @@ export type DbTxArgsByName = {
   wechatPromoteTaskAttachments: WechatPromoteTaskAttachmentsArgs;
   wechatRefreshOutboxContexts: WechatRefreshOutboxContextsArgs;
   wechatUnbindCleanup: WechatUnbindCleanupArgs;
+  'skillUsage.applyMutation': SkillUsageApplyMutationArgs;
   'session.importShare': SessionImportShareArgs;
 };
 
@@ -886,6 +971,7 @@ export type DbTxResultByName = {
   'message.delete': MessageDeleteResult;
   'im.deleteBindings': undefined;
   'im.replaceBinding': undefined;
+  'im.rotateSession': ImRotateSessionResult;
   wechatActivateBindingEpoch: WechatActivateBindingEpochResult;
   wechatCommitPollBatch: WechatCommitPollBatchResult;
   wechatLeaseNextTask: WechatLeasedTask | null;
@@ -903,5 +989,6 @@ export type DbTxResultByName = {
   wechatPromoteTaskAttachments: WechatPromoteTaskAttachmentsResult;
   wechatRefreshOutboxContexts: WechatRefreshOutboxContextsResult;
   wechatUnbindCleanup: WechatUnbindCleanupResult;
+  'skillUsage.applyMutation': undefined;
   'session.importShare': { messageCount: number };
 };

@@ -17,7 +17,6 @@ import {
   ActivityIndicator,
   AppState,
   FlatList,
-  KeyboardAvoidingView,
   Linking,
   Platform,
   Pressable,
@@ -119,6 +118,7 @@ import { RecentPhotosStrip, ScreenshotsGrid } from '@/session/ContextSheetMediaV
 import { ContextSheetGoalCreateForm } from '@/session/ContextSheetGoalView';
 import type { MobileGoalLimitsInput } from '@cindy/maker-shared/device-link-contract';
 import { ComposerAttachmentCollapsedBadge, ComposerAttachmentTray } from '@/session/ComposerAttachmentTray';
+import { SlowSendNotice, type SlowSendPhase } from '@/session/SlowSendNotice';
 import { ImageLightbox } from '@/session/ImageLightbox';
 import {
   useComposerImageAnnotations,
@@ -224,6 +224,7 @@ import {
 } from '@/session/MobileComposerInputRow';
 import { VoiceRecordingPillContent, useMobileVoiceRecordingTimer } from '@/session/VoiceRecordingPill';
 import { useComposerCardTransition } from '@/session/useComposerCardTransition';
+import { ComposerKeyboardAvoidingView } from '@/session/ComposerKeyboardAvoidingView';
 import { useComposerResize } from '@/session/useComposerResize';
 import { useMobileKeyboardState } from '@/session/useMobileKeyboardState';
 import {
@@ -482,11 +483,13 @@ export default function NewRemoteSessionScreen() {
   const [draft, setDraft] = useState<NewSessionDraft>({
     ...DEFAULT_NEW_SESSION_DRAFT,
     firstMessage: visualInitialDraft ?? DEFAULT_NEW_SESSION_DRAFT.firstMessage,
-    // 默认进入「对话」(无项目),对齐桌面;只有从项目入口带了 workingDir 才默认项目模式。
+    // 无记忆时默认对话；偏好加载后恢复上次选择，显式项目入口优先。
     workspaceKind: initialWorkingDir ? 'project' : 'dialogue',
     workingDir: initialWorkingDir ?? '',
   });
   const [creating, setCreating] = useState(false);
+  const [createStartedAt, setCreateStartedAt] = useState<number | null>(null);
+  const [createPhase, setCreatePhase] = useState<SlowSendPhase>('preparing');
   const [error, setError] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<MobileAgentCapabilities | null>(null);
   const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
@@ -605,10 +608,13 @@ export default function NewRemoteSessionScreen() {
   useEffect(() => {
     const stashed = drainStashedNewSessionDraft();
     if (!stashed) return;
+    // 返回编辑沿用草稿的工作区，不能被随后加载的全局默认覆盖。
+    userTouchedWorkspaceRef.current = true;
     setDraft(stashed.draft);
     setAttachments([...stashed.attachments]);
     if (stashed.notice) setAttachmentError(stashed.notice);
     if (stashed.deviceId) {
+      userTouchedDeviceRef.current = true;
       setSelectedDeviceId(stashed.deviceId);
       setSelectedDeviceName(stashed.deviceName || stashed.deviceId);
     }
@@ -688,6 +694,7 @@ export default function NewRemoteSessionScreen() {
   // 权限记忆只在偏好加载后恢复一次(之后由用户选择 / 切 agent 驱动),防止重复覆盖。
   const appliedPermissionMemoryRef = useRef(false);
   const userTouchedDeviceRef = useRef(false);
+  const userTouchedWorkspaceRef = useRef(false);
   const firstMessageRef = useRef(draft.firstMessage);
   const firstMessageInputRef = useRef<NativeTextInput>(null);
   const voiceDraftScrollRef = useRef<ScrollView>(null);
@@ -827,7 +834,14 @@ export default function NewRemoteSessionScreen() {
     setNewSessionPreferencesLoaded(false);
     void readNewSessionPreferences()
       .then((preferences) => {
-        if (!cancelled) setNewSessionPreferences(preferences);
+        if (cancelled) return;
+        setNewSessionPreferences(preferences);
+        const workspaceKind = preferences.workspaceKind;
+        if (!initialWorkingDir && workspaceKind) {
+          setDraft((current) => userTouchedWorkspaceRef.current
+            ? current
+            : { ...current, workspaceKind });
+        }
       })
       .finally(() => {
         if (!cancelled) setNewSessionPreferencesLoaded(true);
@@ -1217,7 +1231,15 @@ export default function NewRemoteSessionScreen() {
       && worktreeEligibility.status === 'eligible'
       && (!worktreeBranchPreferenceReady || worktreeBranchPreferenceError));
   const worktreeControlCaptionKey = worktreeCaptionKey
+    ?? (worktreePreferenceAuthorityUnknown ? 'session.new.worktreeSettingsSyncFailed' : null)
+    ?? (worktreePreferenceCreateBlocked ? 'session.new.worktreeSettingsSaving' : null)
     ?? (worktreeBranchPreferenceError ? 'session.new.worktreeBranchSyncFailed' : null);
+  const resolveWorktreePreferenceGateErrorKey = useCallback(() => (
+    selectedDeviceId != null
+      && worktreePreferenceAuthorityUnknownByDeviceRef.current.has(selectedDeviceId)
+      ? 'session.new.worktreeSettingsSyncFailed'
+      : 'session.new.worktreeSettingsSaving'
+  ), [selectedDeviceId]);
 
   useLayoutEffect(() => {
     worktreePreferenceRenderedRef.current = {
@@ -1479,7 +1501,7 @@ export default function NewRemoteSessionScreen() {
     || permissionSheetOpen
     || voiceIsBusy
     || composerVoiceHoldActive;
-  useComposerCardTransition(composerCardActive);
+  useComposerCardTransition(composerCardActive, keyboardState);
   // 下拉收起 = 退出聚焦激活态(模型浮窗已是独立 Modal,拖拽手势够不到它,无需在此关闭)。
   // 语音结束 hold 态未聚焦,blur 是 no-op,需显式解除 hold 才能收回简洁态。
   const handleComposerSnapToAuto = useCallback(() => {
@@ -2128,6 +2150,8 @@ export default function NewRemoteSessionScreen() {
   }, [patchDraft]);
 
   const selectDialogueWorkspace = useCallback(() => {
+    userTouchedWorkspaceRef.current = true;
+    void saveNewSessionPreferences({ workspaceKind: 'dialogue' });
     patchDraft({ workspaceKind: 'dialogue', workingDir: '' });
     setWorkspacePickerOpen(false);
     setBrowseOpen(false);
@@ -2135,6 +2159,8 @@ export default function NewRemoteSessionScreen() {
   }, [patchDraft]);
 
   const selectRecentProject = useCallback((workingDir: string) => {
+    userTouchedWorkspaceRef.current = true;
+    void saveNewSessionPreferences({ workspaceKind: 'project' });
     patchDraft({ workspaceKind: 'project', workingDir });
     setWorkspacePickerOpen(false);
     setBrowseOpen(false);
@@ -2142,6 +2168,8 @@ export default function NewRemoteSessionScreen() {
   }, [patchDraft]);
 
   const openProjectBrowse = useCallback(() => {
+    userTouchedWorkspaceRef.current = true;
+    void saveNewSessionPreferences({ workspaceKind: 'project' });
     patchDraft({ workspaceKind: 'project' });
     setWorkspacePickerOpen(false);
     setBrowseOpen(true);
@@ -2750,6 +2778,11 @@ export default function NewRemoteSessionScreen() {
   // 全新设备在 store 中没有镜像时本来就是默认未勾选,无需失败路径代替宿主写值。
   const worktreeSeedAgentKindRef = useRef(draft.agentKind);
   worktreeSeedAgentKindRef.current = draft.agentKind;
+  // 资格探测完成后才有这个标记。它只用于「缺字段时能不能把老被控端当 ready」,
+  // 不能进本 effect 依赖:选目录会让探测结果换代,cleanup 会把还在飞的 GET 取消掉,
+  // 合格目录上偏好门一直不放行,发送按钮就灰着还没提示。
+  const worktreeHostSupportsRecoveryKeyDiscardRef = useRef(worktreeHostSupportsRecoveryKeyDiscard);
+  worktreeHostSupportsRecoveryKeyDiscardRef.current = worktreeHostSupportsRecoveryKeyDiscard;
   useEffect(() => {
     const seq = ++worktreeSeedSeqRef.current;
     const syncKey = worktreePreferenceSyncKey;
@@ -2806,7 +2839,7 @@ export default function NewRemoteSessionScreen() {
         }
         if (
           classification.status === 'missing'
-          && worktreeHostSupportsRecoveryKeyDiscard === false
+          && worktreeHostSupportsRecoveryKeyDiscardRef.current === false
         ) {
           // Old hosts cannot persist this preference and also lack the recovery
           // capability marker. A new host can transiently return `{}` before its
@@ -2839,7 +2872,6 @@ export default function NewRemoteSessionScreen() {
     deviceLinkStatus,
     presenceVersion,
     selectedDeviceId,
-    worktreeHostSupportsRecoveryKeyDiscard,
     worktreePreferenceSyncKey,
     worktreeSeedRetryNonce,
     maker,
@@ -3339,6 +3371,7 @@ export default function NewRemoteSessionScreen() {
     <ComposerResizeGrabber
       onAdjust={composerResize.adjustByLine}
       panHandlers={composerResize.panHandlers}
+      gesture={composerResize.gesture}
       testID="newSession.composerResizeGrabber"
       visible
     />
@@ -3654,6 +3687,9 @@ export default function NewRemoteSessionScreen() {
 
   useEffect(() => {
     if (!selectedDeviceId || draft.workspaceKind !== 'project' || draft.workingDir.trim()) return;
+    // 恢复项目模式后，等默认设备同步完成再选目录，避免借用上一台电脑的路径。
+    if (!newSessionPreferencesLoaded) return;
+    if (!userTouchedDeviceRef.current && selectedDeviceId !== preferredDefaultDevice?.deviceId) return;
 
     const key = `${selectedDeviceId}:${initialWorkingDir ?? ''}`;
     if (initialWorkspaceKeyRef.current === key) return;
@@ -3675,6 +3711,8 @@ export default function NewRemoteSessionScreen() {
     loadBrowsePath,
     recentWorkspaces,
     selectWorkingDir,
+    newSessionPreferencesLoaded,
+    preferredDefaultDevice?.deviceId,
   ]);
 
   const selectSlashCommand = useCallback((command: MobileSlashCommand) => {
@@ -3969,7 +4007,7 @@ export default function NewRemoteSessionScreen() {
         || worktreePreferenceReadyKeyRef.current !== worktreePreferenceSyncKeyRef.current
       )
     ) {
-      setError(t('session.new.worktreeSettingsSaving'));
+      setError(t(resolveWorktreePreferenceGateErrorKey()));
       return;
     }
     if (
@@ -3988,15 +4026,18 @@ export default function NewRemoteSessionScreen() {
     if (worktreeCreateBlocked) {
       setError(worktreeCaptionKey
         ? t(worktreeCaptionKey)
-        : t('session.new.worktreeSettingsSaving'));
+        : t(resolveWorktreePreferenceGateErrorKey()));
       return;
     }
     const worktreeIntent = captureWorktreeCreateIntent();
     if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-      setError(t('session.new.worktreeSettingsSaving'));
+      setError(t(resolveWorktreePreferenceGateErrorKey()));
       return;
     }
     creatingRef.current = true;
+    const startedAt = Date.now();
+    setCreateStartedAt(startedAt);
+    setCreatePhase('preparing');
     setCreating(true);
     setError(null);
     // 乐观交接标记:startNewSessionCreation + router.replace 成功后本页即将
@@ -4032,10 +4073,12 @@ export default function NewRemoteSessionScreen() {
       // 拍照 / 选图后立刻点创建是常见路径:等在途图片上传落定(乐观托盘)。
       // 有失败就中止创建——错误文案已由上传回调写入 attachmentError,让用户处理;
       // 此时不该带着残缺附件去开新会话。
+      setCreatePhase('uploading');
       const { failedCount } = await waitForPendingUploads();
       if (!isCurrentOwner()) return;
       if (!ensureDeviceAlive()) return;
       if (failedCount > 0) return;
+      setCreatePhase('preparing');
       // await 之后闭包里的 attachments 是旧值,经 ref 拿含刚落定图片的最新列表。
       const sendAttachments = attachmentsRef.current;
       const validation = validateNewSessionDraft(effectiveDraft, { attachmentCount: sendAttachments.length });
@@ -4043,25 +4086,12 @@ export default function NewRemoteSessionScreen() {
         setError(validation);
         return;
       }
-      // 鉴权门禁:已知无已连接供应商时不发起创建(创建即失败,还会白跑一个往返)。
-      // 目录缓存可能过期(用户刚在电脑端配好 key):拦截前现拉一遍确认;确认不了
-      // (已连接 / 空目录 / 拉失败)时缓存判死已不可信,清掉重取并放行。
-      if (agentAuthVerdict === 'unauthenticated') {
-        if ((await confirmAgentUnauthenticated(effectiveDraft.agentKind, selectedDeviceId)).unauthenticated) {
-          if (!isCurrentOwner()) return;
-          if (!ensureDeviceAlive()) return;
-          setError(agentAuthGateHint(effectiveDraft.agentKind));
-          return;
-        }
-        if (!isCurrentOwner()) return;
-        // 确认期间切设备 → 不再驱逐(驱逐的是旧设备缓存,继续创建也无意义)。
-        if (!ensureDeviceAlive()) return;
-        evictDeviceProviders(selectedDeviceId);
-      }
+      // 鉴权和模型的网络终检集中在后台建链后执行，避免表单先等一轮、管线再等一轮。
       if (!isCurrentOwner()) return;
       if (!ensureDeviceAlive()) return;
       void saveNewSessionPreferences({
         agentKind: effectiveDraft.agentKind,
+        workspaceKind: effectiveDraft.workspaceKind,
         device: {
           deviceId: selectedDeviceId,
           name: selectedDeviceName || selectedDeviceId,
@@ -4114,7 +4144,7 @@ export default function NewRemoteSessionScreen() {
           return;
         }
         if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-          setError(t('session.new.worktreeSettingsSaving'));
+          setError(t(resolveWorktreePreferenceGateErrorKey()));
           return;
         }
       }
@@ -4181,7 +4211,7 @@ export default function NewRemoteSessionScreen() {
           if (!isCurrentOwner()) return;
           if (!ensureDeviceAlive()) return;
           if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-            setError(t('session.new.worktreeSettingsSaving'));
+            setError(t(resolveWorktreePreferenceGateErrorKey()));
             return;
           }
           const recoveryKey = createNewSessionId();
@@ -4222,7 +4252,7 @@ export default function NewRemoteSessionScreen() {
               recoveryKey,
               createdAt,
             });
-            setError(t('session.new.worktreeSettingsSaving'));
+            setError(t(resolveWorktreePreferenceGateErrorKey()));
             return;
           }
           const createRequest = buildWorktreeCreateRequest({
@@ -4301,6 +4331,7 @@ export default function NewRemoteSessionScreen() {
           providerId: effectiveDraft.providerId,
         });
         const runGuard = () => resolveSubmitGuardCatalog({
+          deferRefreshToCreation: true,
           cached: () => getCachedDeviceProviders(guardDeviceId),
           gen: () => getDeviceProvidersGen(guardDeviceId),
           // 强制刷新(codex review P2):fetchDeviceProviders 缓存命中直接返回旧目录,
@@ -4382,6 +4413,7 @@ export default function NewRemoteSessionScreen() {
         : null;
       if (!isCurrentOwner()) return;
       startNewSessionCreation({
+        startedAt,
         sessionId,
         deviceId: deviceIdSnapshot,
         deviceName: selectedDeviceName,
@@ -4475,6 +4507,7 @@ export default function NewRemoteSessionScreen() {
       if (!handedOff) {
         creatingRef.current = false;
         setCreating(false);
+        setCreateStartedAt(null);
       }
     }
   }, [
@@ -4507,6 +4540,7 @@ export default function NewRemoteSessionScreen() {
     worktreeEnabled,
     captureWorktreeCreateIntent,
     isWorktreeCreateIntentCurrent,
+    resolveWorktreePreferenceGateErrorKey,
   ]);
 
   // 目标模式建会话(对齐桌面 handleCreateGoal):createSession → goal.set(被控端落
@@ -4536,7 +4570,7 @@ export default function NewRemoteSessionScreen() {
         || worktreePreferenceReadyKeyRef.current !== worktreePreferenceSyncKeyRef.current
       )
     ) {
-      setGoalError(t('session.new.worktreeSettingsSaving'));
+      setGoalError(t(resolveWorktreePreferenceGateErrorKey()));
       return;
     }
     if (
@@ -4557,12 +4591,12 @@ export default function NewRemoteSessionScreen() {
     if (worktreeCreateBlocked) {
       setGoalError(worktreeCaptionKey
         ? t(worktreeCaptionKey)
-        : t('session.new.worktreeSettingsSaving'));
+        : t(resolveWorktreePreferenceGateErrorKey()));
       return;
     }
     const worktreeIntent = captureWorktreeCreateIntent();
     if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-      setGoalError(t('session.new.worktreeSettingsSaving'));
+      setGoalError(t(resolveWorktreePreferenceGateErrorKey()));
       return;
     }
     // ㉙ 设备守卫入口(独立 review P1-1 + busy 泄漏):快照取自闭包 selectedDeviceId,
@@ -4696,7 +4730,7 @@ export default function NewRemoteSessionScreen() {
           return;
         }
         if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-          setGoalError(t('session.new.worktreeSettingsSaving'));
+          setGoalError(t(resolveWorktreePreferenceGateErrorKey()));
           return;
         }
       }
@@ -4721,7 +4755,7 @@ export default function NewRemoteSessionScreen() {
           if (!isCurrentOwner()) return;
           if (!ensureDeviceAlive()) return;
           if (!isWorktreeCreateIntentCurrent(worktreeIntent)) {
-            setGoalError(t('session.new.worktreeSettingsSaving'));
+            setGoalError(t(resolveWorktreePreferenceGateErrorKey()));
             return;
           }
           const recoveryKey = createNewSessionId();
@@ -4757,7 +4791,7 @@ export default function NewRemoteSessionScreen() {
               recoveryKey,
               createdAt,
             });
-            setGoalError(t('session.new.worktreeSettingsSaving'));
+            setGoalError(t(resolveWorktreePreferenceGateErrorKey()));
             return;
           }
           const createRequest = buildWorktreeCreateRequest({
@@ -4814,6 +4848,7 @@ export default function NewRemoteSessionScreen() {
       }
       void saveNewSessionPreferences({
         agentKind: draft.agentKind,
+        workspaceKind: draft.workspaceKind,
         device: {
           deviceId: selectedDeviceId,
           name: selectedDeviceName || selectedDeviceId,
@@ -5279,11 +5314,14 @@ export default function NewRemoteSessionScreen() {
     worktreeEnabled,
     captureWorktreeCreateIntent,
     isWorktreeCreateIntentCurrent,
+    resolveWorktreePreferenceGateErrorKey,
   ]);
 
   return (
     <SafeAreaView style={styles.safeArea} testID="newSession.screen">
-      <KeyboardAvoidingView
+      <ComposerKeyboardAvoidingView
+        keyboard={keyboardState}
+        bottomInset={safeAreaInsets.bottom}
         behavior={keyboardAvoidingBehaviorForPlatform(
           Platform.OS === 'ios' ? 'ios' : Platform.OS === 'android' ? 'android' : 'web',
         )}
@@ -5743,6 +5781,7 @@ export default function NewRemoteSessionScreen() {
                   {attachmentError}
                 </Text>
               ) : null}
+              <SlowSendNotice startedAt={creating ? createStartedAt : null} phase={createPhase} />
               {voiceStatusVisible ? (
                 <View style={styles.voiceStatusRow}>
                   <Text style={styles.voiceStatusText} testID="newSession.voiceStatus">
@@ -5772,7 +5811,7 @@ export default function NewRemoteSessionScreen() {
                   cursorColor={colors.inputCaret}
                   inputRef={firstMessageInputRef}
                   leading={renderComposerCompactLeading()}
-                  inputFrameHeight={composerResize.frameHeight}
+                  inputFrameAnimatedStyle={composerResize.frameStyle}
                   // 听写期间把输入区撑到 44pt 触控目标:此时「点输入区停止听写」的命中层
                   // 是这层输入区自身(TextInput 的 onPressIn),单行时只有 28pt。
                   inputFrameMinHeight={voiceIsListening ? MOBILE_COMPOSER_MIN_TOUCH_TARGET : undefined}
@@ -5811,7 +5850,7 @@ export default function NewRemoteSessionScreen() {
             </View>
           </View>
         </View>
-      </KeyboardAvoidingView>
+      </ComposerKeyboardAvoidingView>
       <ContextSheet
         footer={contextSheetView !== 'goal' && pendingMediaAssets.length > 0 ? (
           <ContextSheetFooterButton
